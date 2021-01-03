@@ -2,8 +2,8 @@
 #define CONNECTOR_H
 
 static int header_length = 4;
-static char IP[16] = "127.0.0.1";
-static int PORT = 8000;
+static char PROXY_IP[16] = "127.0.0.1";
+static int PROXY_PORT = 8000;
 static int running = 0;
 enum error_codes {
   GOOD,
@@ -24,9 +24,9 @@ static const char *errors[] = {
   "already running",
 };
 
-void changeIP(const char *ip);
-void changePort(int port);
-const char* start(const char *route);
+void change_proxy_ip(const char *ip);
+void change_proxy_port(int port);
+const char* start(const char *route, const char *addr);
 void stop(void);
 
 #endif

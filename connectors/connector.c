@@ -8,15 +8,15 @@
 #include <string.h>
 #include <sys/socket.h>
 
-void changeIP(const char *ip) {
-  strcpy(IP, ip);
+void change_proxy_ip(const char *ip) {
+  strcpy(PROXY_IP, ip);
 }
 
-void changePort(int port) {
-  PORT = port;
+void change_proxy_port(int port) {
+  PROXY_PORT = port;
 }
 
-const char* start(const char *route) {
+const char* start(const char *route, const char *addr) {
   if (running)
     return errors[RUNNING];
 
@@ -27,10 +27,10 @@ const char* start(const char *route) {
 
   serv_addr.sin_family = AF_INET;
   // Convert port
-  serv_addr.sin_port = htons(PORT);
+  serv_addr.sin_port = htons(PROXY_PORT);
 
   // Convert IPv4 and IPv6 addresses from text to binary form
-  if (inet_pton(AF_INET, IP, &serv_addr.sin_addr) <= 0)
+  if (inet_pton(AF_INET, PROXY_IP, &serv_addr.sin_addr) <= 0)
     return errors[ADDR];
 
   if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
