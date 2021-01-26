@@ -1,10 +1,14 @@
 package main
 
-/*
- * TODO: Make server listener an http server
- * TODO: Allow get requests fora list of the current servers connected
+/* TODO
+ * Make server listener an http server
+ * Allow get requests fora list of the current servers connected
  * Possibly remove some logs of errors that naturally occur (like EOF on conns)
-*/
+ */
+
+/* Notes
+ * Servers connecting to proxy must have their base route as the route the send
+ */
 
 import (
   "bufio"
@@ -19,14 +23,57 @@ import (
   "time"
 )
 
+type Conn struct {
+  host string
+  // Disconnect is set to true if the server fails to respond the first time
+  // If disconnect is already true, the next failure results in removal
+  disconnect bool
+}
+
+type ConnMap struct {
+  conns map[string]Conn
+  sync.RWMutex
+}
+
+func (cm *ConnMap) Load(k string) (v string, ok bool) {
+  cm.RLock()
+  defer cm.RUnlock()
+  v, ok = cm.conns[k]
+  return
+}
+
+func (cm *ConnMap) Store(k, v string) bool {
+  cm.Lock()
+  defer cm.Unlock()
+  if _, ok := cm.conns[k]; ok {
+    return false
+  }
+  cm.conns[k] = v
+  return true
+}
+
+func (cm *ConnMap) Delete(k string) {
+  cm.Lock()
+  defer cm.Unlock()
+  delete(cm.conns[k])
+}
+
 var (
-  ip string
-  port string
+  ip string = "192.168.1.137"
+  port string = "443"
   internalIP string = "localhost"
   internalPort string = "9999"
-  conns sync.Map
+  conns ConnMap
   logger *log.Logger
 )
+
+var debug bool = true
+
+func debugLog(msg string) {
+  if debug {
+    log.Println(msg)
+  }
+}
 
 func main() {
   logger = log.New(os.Stdout, "Proxy: ", log.LstdFlags)
@@ -43,6 +90,9 @@ func main() {
       port = "8000"
     }
   }
+  conns = ConnMap{
+    conns: make(map[string]Conn),
+  }
 
   go listenServer()
 
@@ -52,6 +102,7 @@ func main() {
   if err != nil {
     panic(err)
   }
+  logger.Printf("Listening to web on %s:%s\n", ip, port)
   for {
     conn, err := ln.Accept()
     if err != nil {
@@ -71,7 +122,7 @@ func handle(webConn net.Conn) {
     return
   }
   var serverConn net.Conn
-  defer serverConn.Close()
+  // defer serverConn.Close()
   // Use block so that everything below isn't kept if the conn is kept alive
   {
     // Parse the request
@@ -93,7 +144,7 @@ func handle(webConn net.Conn) {
         firstSlash = false
       }
     }
-    route := string(u.Path[:l])
+    route := string(u.Path[:i])
     if route[0] != '/' {
       route = "/" + route
     }
@@ -111,6 +162,7 @@ func handle(webConn net.Conn) {
       logger.Println(err)
       return
     }
+    defer serverConn.Close()
     if _, err := serverConn.Write(bmsg[:l]); err != nil {
       logger.Println(err)
       return
@@ -160,11 +212,13 @@ func handle(webConn net.Conn) {
   }
 }
 
+/*
 func listenServer() {
   ln, err := net.Listen("tcp", internalIP + ":" + internalPort)
   if err != nil {
     panic(err)
   }
+  logger.Printf("Listening to servers on %s:%s\n", internalIP, internalPort)
   var bmsg [64]byte
   // convert to http server
   for {
@@ -187,25 +241,42 @@ func listenServer() {
     conn.Close()
   }
 }
+*/
+
+func listenServer() {
+  server := &http.Server{
+    Addr: internalIP + ":" + internalPort,
+    Handler: http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+      if r.Method == http.MethodGet {
+        //
+        return
+      }
+      host, route := r.FormValue("host"), r.FormValue("route")
+    }),
+  }
+}
 
 // ping sends GET requests to each conn every minute to make sure they're alive
 func ping() {
   timer := time.AfterFunc(time.Minute, func() {
-    // Iterate over each connection
-    conns.Range(func(iRoute, iHost interface{}) bool {
-      _, err := http.Get(fmt.Sprintf("http://%s", iHost.(string)))
-      // An error will be thrown if the request fails
+    for route, conn := range conns.conns {
+      _, err := http.Get(host)
       if err != nil {
-        // If the connection was refused, the connection is closed
         if strings.Contains(err.Error(), "refused") {
-          conns.Delete(iRoute)
+          if conn.disconnect {
+            conns.Delete(route)
+          } else {
+            conn.disconnect = true
+          }
+        } else {
+          conn.disconnect = false
         }
+      } else {
+        conn.disconnect = false
       }
-      return true
-    })
+    }
   })
-  for {
-    <-timer.C
-    timer.Reset(time.Minute)
-  }
+  <-timer.C
+  timer.Reset(time.Minute)
 }
+
