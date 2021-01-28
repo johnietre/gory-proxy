@@ -1,9 +1,10 @@
 package main
 
 /* TODO
- * Make server listener an http server
- * Allow get requests fora list of the current servers connected
+ * Make loops through conns (for loops) concurrent safe
  * Possibly remove some logs of errors that naturally occur (like EOF on conns)
+ * Fix invalid type assertion error around line 160 (iConn.(*Conn)
+ * Fix http.HandleFunc used as value around line 250
  */
 
 /* Notes
@@ -31,18 +32,18 @@ type Conn struct {
 }
 
 type ConnMap struct {
-  conns map[string]Conn
+  conns map[string]*Conn
   sync.RWMutex
 }
 
-func (cm *ConnMap) Load(k string) (v string, ok bool) {
+func (cm *ConnMap) Load(k string) (v *Conn, ok bool) {
   cm.RLock()
   defer cm.RUnlock()
   v, ok = cm.conns[k]
   return
 }
 
-func (cm *ConnMap) Store(k, v string) bool {
+func (cm *ConnMap) Store(k string, v *Conn) bool {
   cm.Lock()
   defer cm.Unlock()
   if _, ok := cm.conns[k]; ok {
@@ -55,7 +56,7 @@ func (cm *ConnMap) Store(k, v string) bool {
 func (cm *ConnMap) Delete(k string) {
   cm.Lock()
   defer cm.Unlock()
-  delete(cm.conns[k])
+  delete(cm.conns, k)
 }
 
 var (
@@ -91,7 +92,7 @@ func main() {
     }
   }
   conns = ConnMap{
-    conns: make(map[string]Conn),
+    conns: make(map[string]*Conn),
   }
 
   go listenServer()
@@ -152,12 +153,12 @@ func handle(webConn net.Conn) {
       route += "/"
     }
     // Find the host that matches the route, if any
-    iHost, ok := conns.Load(route)
+    iConn, ok := conns.Load(route)
     if !ok {
       return
     }
-    host := iHost.(string)
-    serverConn, err = net.Dial("tcp", host)
+    c := iConn.(*Conn)
+    serverConn, err = net.Dial("tcp", c.host)
     if err != nil {
       logger.Println(err)
       return
@@ -248,10 +249,56 @@ func listenServer() {
     Addr: internalIP + ":" + internalPort,
     Handler: http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
       if r.Method == http.MethodGet {
-        //
+        rAndH := ""
+        for r, c := range conns.conns {
+          rAndH += fmt.Sprintf("%s\t%s\n", r, c.host)
+        }
+        w.Write([]byte(rAndH))
         return
       }
-      host, route := r.FormValue("host"), r.FormValue("route")
+      host, route, remove := r.FormValue("host"), r.FormValue("route"), r.FormValue("remove")
+      if remove != "" {
+        if route != "" {
+          if conn, ok := conns.Load(route); !ok {
+            w.Write([]byte("route " + route +  "  doesn't exist"))
+          } else {
+            conns.Delete(route)
+            w.Write([]byte("removed " +conn. host + route))
+          }
+        } else if host != "" {
+          for r, c := range conns.conns {
+            if host == c.host {
+              conns.Delete(r)
+              w.Write([]byte("removed " +c.host + r))
+              return
+            }
+          }
+          w.Write([]byte("host " + host + "  doesn't exist"))
+        } else {
+          w.Write([]byte("must provide host or route"))
+        }
+        return
+      }
+      msg, bad := "", false
+      for r, c := range conns.conns {
+        if !bad {
+          bad = (c.host == host || r == route)
+        }
+        if c.host == host {
+          msg += "host name taken "
+        }
+        if r == route {
+          msg += "route is taken"
+        }
+      }
+      if bad {
+        return
+      }
+      if !conns.Store(route, &Conn{host, false}) {
+        w.Write([]byte("route or host taken"))
+      } else {
+        w.Write([]byte("all good"))
+      }
     }),
   }
 }
@@ -260,7 +307,7 @@ func listenServer() {
 func ping() {
   timer := time.AfterFunc(time.Minute, func() {
     for route, conn := range conns.conns {
-      _, err := http.Get(host)
+      _, err := http.Get(conn.host)
       if err != nil {
         if strings.Contains(err.Error(), "refused") {
           if conn.disconnect {

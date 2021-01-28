@@ -16,12 +16,20 @@ var (
 func main() {
   route := flag.String("route", "", "The route for the proxy")
   host := flag.String("host", "", "The host/address of server")
-  remove := flag.String("remove", "", "The route or host/address of the server to remove from the proxy")
+  remove := flag.Bool("remove", false, "Remove the host or route given using the -host or -route flags")
 
   flag.Parse()
 
-  if *remove != "" {
-    form := url.Values{"remove": {*remove}}
+  if *remove {
+    var form url.Values
+    if *route != "" {
+      form = url.Values{"remove": {"1"}, "route": {*route}}
+    } else if *host != "" {
+      form = url.Values{"remove": {"1"}, "host": {*host}}
+    } else {
+      println("Must provide host or route")
+      return
+    }
     resp, err := http.PostForm(proxy_url, form)
     if err != nil {
       println(err.Error())
