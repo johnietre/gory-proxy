@@ -22,8 +22,10 @@ func main() {
   remove := flag.Bool("remove", false, "Remove the host or route given using the -host or -route flags")
 
   flag.Parse()
+
   var form url.Values
   if *remove {
+    // Take the route over the host
     if *route != "" {
       form = url.Values{"remove": {"1"}, "route": {*route}}
     } else if *host != "" {
@@ -32,27 +34,19 @@ func main() {
       println("Must provide host or route")
       return
     }
-    resp, err := http.PostForm(proxyURL, form)
-    if err != nil {
-      println(err.Error())
-      return
-    }
-    if body, err := ioutil.ReadAll(resp.Body); err != nil {
+    // Send the remove form
+    if body, err := sendRequest(form); err != nil {
       println(err.Error())
     } else {
-      println(string(body))
+      println(body)
     }
     return
   } else if *route == "" && *host == "" {
-    resp, err := http.Get(proxyURL)
-    if err != nil {
-      println(err.Error())
-      return
-    }
-    if body, err := ioutil.ReadAll(resp.Body); err != nil {
+    // Get a list of all host and routes currently connected
+    if body, err := sendRequest(nil); err != nil {
       println(err.Error())
     } else {
-      println(string(body))
+      println(body)
     }
     return
   } else if *route == "" {
@@ -62,6 +56,7 @@ func main() {
     println("Must provide host")
     return
   }
+
   // Clean the input
   if (*host)[len(*host)-1] == '/' {
   }
@@ -72,21 +67,16 @@ func main() {
     *route += "/"
   }
 
-  form := url.Values{"route": {*route}, "host": {*host}}
-  resp, err := http.PostForm(proxyURL, form)
-  if err != nil {
-    println(err.Error())
-    return
-  }
-  body, err := ioutil.ReadAll(resp.Body)
-  if err != nil {
+  // Send the form
+  form = url.Values{"route": {*route}, "host": {*host}}
+  if body, err := sendRequest(form); err != nil {
     println(err.Error())
   } else {
-    println(string(body))
+    println(body)
   }
 }
 
-func sendRequst(form url.Values) (string, error) {
+func sendRequest(form url.Values) (string, error) {
   var err error
   var resp *http.Response
   if form == nil {
