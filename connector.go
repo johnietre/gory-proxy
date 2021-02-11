@@ -5,12 +5,12 @@ import (
   "io/ioutil"
   "net/http"
   "net/url"
-  "os/exec"
-  "strings"
+  // "os/exec"
+  // "strings"
 )
 
 var (
-  proxy_url string = "http://localhost:9999/"
+  proxyURL string = "http://localhost:9999/"
 )
 
 func main() {
@@ -30,20 +30,24 @@ func main() {
       println("Must provide host or route")
       return
     }
-    resp, err := http.PostForm(proxy_url, form)
+    resp, err := http.PostForm(proxyURL, form)
     if err != nil {
+      println(err.Error())
+      return
+    }
+    if body, err := ioutil.ReadAll(resp.Body); err != nil {
       println(err.Error())
     } else {
       println(string(body))
     }
     return
   } else if *route == "" && *host == "" {
-    resp, err := http.Get(proxy_url)
+    resp, err := http.Get(proxyURL)
     if err != nil {
       println(err.Error())
+      return
     }
-    body, err := iotuil.ReadAll(resp.Body)
-    if err != nil {
+    if body, err := ioutil.ReadAll(resp.Body); err != nil {
       println(err.Error())
     } else {
       println(string(body))
@@ -57,17 +61,17 @@ func main() {
     return
   }
   // Clean the input
-  if *host[len(*host)-1] == '/' {
+  if (*host)[len(*host)-1] == '/' {
   }
-  if *route[0] != '/' {
-    *route = "/" + route
+  if (*route)[0] != '/' {
+    *route = "/" + *route
   }
-  if *route[len(*route)-1] != '/' {
+  if (*route)[len(*route)-1] != '/' {
     *route += "/"
   }
 
   form := url.Values{"route": {*route}, "host": {*host}}
-  resp, err := http.PostForm(proxy_url, form)
+  resp, err := http.PostForm(proxyURL, form)
   if err != nil {
     println(err.Error())
     return
