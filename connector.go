@@ -14,14 +14,16 @@ var (
 )
 
 func main() {
+  // Get the flags from the command line
+  // If adding a host, "route" must be combined with "host"
+  // If removing a host, "remove" must be added as well as "route" or "host"
   route := flag.String("route", "", "The route for the proxy")
   host := flag.String("host", "", "The host/address of server")
   remove := flag.Bool("remove", false, "Remove the host or route given using the -host or -route flags")
 
   flag.Parse()
-
+  var form url.Values
   if *remove {
-    var form url.Values
     if *route != "" {
       form = url.Values{"remove": {"1"}, "route": {*route}}
     } else if *host != "" {
@@ -82,5 +84,20 @@ func main() {
   } else {
     println(string(body))
   }
+}
+
+func sendRequst(form url.Values) (string, error) {
+  var err error
+  var resp *http.Response
+  if form == nil {
+    resp, err = http.Get(proxyURL)
+  } else {
+    resp, err = http.PostForm(proxyURL, form)
+  }
+  if err != nil {
+    return "", err
+  }
+  body, err := ioutil.ReadAll(resp.Body)
+  return string(body), err
 }
 
