@@ -139,7 +139,7 @@ func handle(webConn net.Conn) {
 			return
 		}
 		// Get the first slug
-		// Example: google.com/images/image yields "images"
+		// Example: google.com/images/123 yields "images"
 		u := req.URL
 		lp, i := len(u.Path), 0
 		for firstSlash := u.Path[0] == '/'; i < lp; i++ {
@@ -281,7 +281,7 @@ func ping() {
 		for route, conn := range conns.conns {
 			_, err := http.Get(conn.host)
 			if err != nil {
-				if strings.Contains(err.Error(), "refused") {
+				if strings.Contains(err.Error(), "connection refused") {
 					if conn.disconnect {
 						conns.Delete(route)
 					} else {
@@ -298,4 +298,3 @@ func ping() {
 	<-timer.C
 	timer.Reset(time.Minute)
 }
-

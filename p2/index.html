@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+
+<html lang="en-US">
+
+<head>
+  <title>Index</title>
+  <meta charset="UTF-8">
+</head>
+
+<body>
+  <button onclick="get()">Get</button>
+  <button onclick="post()">Post</button>
+  <script>
+    async function get() {
+      const resp = await fetch("http://localhost:8888");
+      if (!resp.ok)
+        return;
+      const ret = await resp.json();
+      console.log(ret);
+    }
+    async function post() {
+      const resp = await fetch("http://localhost:8888", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          "Access-Control-Allow-Origin": "*"
+        },
+        body: JSON.stringify({
+          path: "/hello",
+          addr: "localhost:9000"
+        })
+      });
+      if (!resp.ok)
+        return;
+      const ret = await resp.text;
+      console.log(ret);
+    }
+  </script>
+</body>
+
+</html>
