@@ -1,19 +1,45 @@
 package main
 
 import (
-	"fmt"
-	"net/http"
+	"regexp"
 )
 
 func main() {
-	client := &http.Client{}
-	if _, err := client.Get("https://google.com"); err != nil {
-		fmt.Println(err)
+	// var urlRegex = regexp.MustCompile(`^(https?://[\w\.]+)/(\w+/?)`)
+	var urlRegex = regexp.MustCompile(`^(https?://[\w:\.]+)(/\w+)?`)
+	matches := urlRegex.FindStringSubmatch("https://localhost:8000/hello")
+	if matches == nil {
+		println("no")
+	} else {
+		for _, m := range matches {
+			println(m)
+		}
 	}
-	if _, err := client.Get("https://yahoo.com"); err != nil {
-		fmt.Println(err)
+	println()
+	matches = urlRegex.FindStringSubmatch("https://google.com/hello")
+	if matches == nil {
+		println("no")
+	} else {
+		for _, m := range matches {
+			println(m)
+		}
 	}
-	if _, err := client.Get("http://localhost:8000"); err != nil {
-		fmt.Println(err)
+	println()
+	matches = urlRegex.FindStringSubmatch("http://local/hello/world")
+	if matches == nil {
+		println("no")
+	} else {
+		for _, m := range matches {
+			println(m)
+		}
+	}
+	println()
+	matches = urlRegex.FindStringSubmatch("http://google.com/")
+	if matches == nil {
+		println("no")
+	} else {
+		for _, m := range matches {
+			println(m)
+		}
 	}
 }

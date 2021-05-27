@@ -60,6 +60,7 @@ type ServerConn struct {
 	// Ex) http://localhost:8000/hello/world => path = hello
 	Path string `json:"path"`
 	// The name/title of the connection (website)
+	// Path and Name aren't the same because Name can have spaces
 	Name string `json:"name,omitempty"`
 	// Tells whether the server is for a website or not
 	// If not, it won't show on the proxy web page
@@ -264,6 +265,9 @@ func servePage(conn net.Conn) {
 	//
 }
 
+// var urlRegex = regexp.MustCompile(`^(https?://[\w:\.]+)(/\w+)?`)
+var urlRegex = regexp.MustCompile(`^(https?://[\w:\.]+)`)
+
 func listenForServers() {
 	/* TODO: Possilby send different codes for failures */
 	serverLogger := log.New(os.Stdout, "Proxy Server: ", log.LstdFlags)
@@ -273,6 +277,16 @@ func listenForServers() {
 			r := http.NewServeMux()
 			r.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 				path, name, addr, website := r.FormValue("path"), r.FormValue("name"), r.FormValue("addr"), false
+				/* TODO:
+				 * Don't need to parse for path, just need address
+				 * Need unique name specified for each new server (separate parameter)
+				 * Handle regex variable above
+				 * Handle regex results below
+				 */
+				u := r.FormValue("url")
+				if matches := urlRegex.FindStringSubmatch(u); matches == nil {
+					log.Panic("err")
+				}
 				if r.Method == http.MethodGet {
 					// Get list of servers
 					var servers []*ServerConn
