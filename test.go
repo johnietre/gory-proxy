@@ -1,14 +1,16 @@
 package main
 
-// import (
-// )
-
-const tests = `
-hello
-goodbye
-` + "goodbye\nmroning"
+import (
+	"fmt"
+	"net"
+)
 
 func main() {
-	println(tests[0] == '\n')
-	println(tests)
+	ips, err := net.LookupIP("https://google.com")
+	if err != nil {
+		panic(err)
+	}
+	for i, ip := range ips {
+		fmt.Println(i, ip.String())
+	}
 }
