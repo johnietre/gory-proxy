@@ -3,6 +3,9 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
+	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -11,9 +14,9 @@ import (
 	"strings"
 	"sync"
 	"time"
-	// "io"
 )
 
+// ServerConn.Path are keys and ServerConn structs are values
 type smap struct {
 	sync.Map
 }
@@ -43,21 +46,11 @@ func (s *smap) delete(addr string) {
 	s.Delete(addr)
 }
 
-func (s *smap) deleteByPath(path string) {
-	s.Range(func(k, v interface{}) bool {
-		if v.(*ServerConn).Path == path {
-			s.delete(k.(string))
-			return false
-		}
-		return true
-	})
-}
-
 // ServerConn holds information about servers connected to the proxy
 type ServerConn struct {
 	// The path (on the proxy) which points to the server
-	// Ex) http://localhost:8000/hello => path = hello
-	// Ex) http://localhost:8000/hello/world => path = hello
+	// Ex) http://localhost:8000/hello => path = /hello
+	// Ex) http://localhost:8000/hello/world => path = /hello
 	Path string `json:"path"`
 	// The name/title of the connection (website)
 	// Path and Name aren't the same because Name can have spaces
@@ -74,18 +67,22 @@ type ServerConn struct {
 	failed bool
 }
 
-var (
+const (
 	ip           string = "localhost"
 	port         string = "8080"
 	internalIP   string = "localhost"
 	internalPort string = "8888"
-	serverConns  smap
-	logger       *log.Logger
+)
+
+var (
+	serverConns smap
+	logger      *log.Logger
 )
 
 func main() {
 	logger = log.New(os.Stdout, "Proxy: ", log.LstdFlags)
 
+	go pageChecker()
 	go listenForServers()
 	go pinger()
 	ln, err := net.Listen("tcp", ip+":"+port)
@@ -110,52 +107,8 @@ func handle(webConn net.Conn) {
 	/* TODO: Figure out how best to handle requests over 5000 bytes */
 	var serverConn net.Conn
 	{
-		// Manually pass the request and response
-		// bmsg, err := io.ReadAll(webConn)
-		// // Will not return EOF error
-		// if err != nil {
-		// 	webConn.Write([]byte("HTTP/1.1 500 Internal Server Error\r\n"))
-		// 	logger.Println(err)
-		// 	return
-		// }
-		// req, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(bmsg[:])))
-		// if err != nil {
-		// 	webConn.Write([]byte("HTTP/1.1 500 Internal Server Error\r\n"))
-		// 	logger.Println(err)
-		// 	return
-		// }
-		// var path string
-		// if matches := pathRegex.FindStringSubmatch(req.URL.Path); matches == nil {
-		// 	webConn.Write([]byte("HTTP/1.1 400 Bad Request\r\n"))
-		// 	return
-		// } else {
-		// 	path = matches[1]
-		// }
-		// if sc := serverConns.load(path); sc == nil {
-		// 	webConn.Write([]byte("HTTP/1.1 404 Not Found\r\n"))
-		// 	return
-		// }
-		// if serverConn, err = net.Dial("tcp", ""); err != nil {
-		// 	webConn.Write([]byte("HTTP/1.1 500 Internal Server Error\r\n"))
-		// 	logger.Println(err)
-		// 	return
-		// }
-		// defer serverConn.Close()
-		// if _, err := serverConn.Write(bmsg[:]); err != nil {
-		// 	webConn.Write([]byte("HTTP/1.1 500 Internal Server Error\r\n"))
-		// 	logger.Println(err)
-		// 	return
-		// }
-		// if req.Header["Upgrage"] == nil || req.Header["Upgrade"][0] != "websocket" {
-		// 	if l, err := serverConn.Read(bmsg[:]); err != nil {
-		// 		webConn.Write(byte[]("HTTP/1.1 500 Internal Server Error\r\n"))
-		// 		logger.Println(err)
-		// 	} else {
-		// 		webConn.Write(bmsg[:l])
-		// 	}
-		// 	return
-		// }
-
+		/* IDEA: Add date to responses */
+		/* IDEA: Create templates for responses */
 		req, err := http.ReadRequest(bufio.NewReader(webConn))
 		if err != nil {
 			/* TODO: Handle specific errors */
@@ -171,7 +124,13 @@ func handle(webConn net.Conn) {
 			path = matches[1]
 		}
 		if path == "/" {
-			servePage(webConn)
+			servePage(webConn, (req.URL.Query().Get("all") == "1"))
+			return
+		} else if path == "/favicon.ico" {
+			/* TODO: Favicon */
+			if _, err = fmt.Fprintf(webConn, "HTTP/1.1 404 Not Found\r\n"); err != nil {
+				logger.Println(err)
+			}
 			return
 		} else if sc := serverConns.load(path); sc == nil {
 			webConn.Write([]byte("HTTP/1.1 404 Not Found\r\n"))
@@ -198,95 +157,120 @@ func handle(webConn net.Conn) {
 			return
 		}
 	}
-	/* TODO: Figure out how to send error messages properly */
 	// Handle websocket message passing
+	/* TODO: Figure out how to send error messages properly */
 	defer serverConn.Close()
-	const buffCap = 256
-	var buff [buffCap]byte
 	for {
-		for {
-			if err := serverConn.SetReadDeadline(time.Now().Add(time.Microsecond)); err != nil {
+		if err := serverConn.SetReadDeadline(time.Now().Add(time.Microsecond)); err != nil {
+			logger.Println(err)
+			return
+		} else if l, err := io.Copy(webConn, serverConn); err != nil {
+			if !strings.HasSuffix(err.Error(), "timeout") {
 				logger.Println(err)
 				return
-			} else if l, err := serverConn.Read(buff[:]); err != nil {
-				if strings.HasSuffix(err.Error(), "timeout") {
-					break
-				} else if !strings.Contains(err.Error(), "EOF") {
-					logger.Println(err)
-				}
-				return
-			} else if _, err = webConn.Write(buff[:l]); err != nil {
-				logger.Println(err)
-				return
-			} else if l < buffCap {
-				break
 			}
+		} else if l == 0 {
+			// Length of 0 used here to mean EOF (socket closed)
+			// Does not accept 0 length messages
+			return
 		}
-		for {
-			if err := webConn.SetReadDeadline(time.Now().Add(time.Microsecond)); err != nil {
+		if err := webConn.SetReadDeadline(time.Now().Add(time.Microsecond)); err != nil {
+			logger.Println(err)
+			return
+		} else if l, err := io.Copy(serverConn, webConn); err != nil {
+			if !strings.HasSuffix(err.Error(), "timeout") {
 				logger.Println(err)
 				return
-			} else if l, err := webConn.Read(buff[:]); err != nil {
-				if strings.HasSuffix(err.Error(), "timeout") {
-					break
-				} else if !strings.Contains(err.Error(), "EOF") {
-					logger.Println(err)
-				}
-				return
-			} else if _, err = serverConn.Write(buff[:l]); err != nil {
-				logger.Println(err)
-				return
-			} else if l < buffCap {
-				break
 			}
+		} else if l == 0 {
+			return
 		}
 	}
 }
 
-const pageResponse = `HTTP/1.1 200 OK` + "\r" + `
-Content-Type: text/html;` + "\r" + `
-<!DOCTYPE HTML>
-<html>
-<head>
-</head>
-<body>
-	<ul>
-		{{range .}}
-			{{if .Website}}
-				//
-			{{end}}
-		{{end}}
-	</ul>
-</body>
-</html>
-`
+const (
+	pageFileName = "index.html"
+	// Responder needs to supply date, pageChecker supplies the content length and content
+	pageResponseTemplate = "HTTP/1.1 200 OK\r\nDate:%s\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %d\r\n\r\n%s"
+)
 
-func servePage(conn net.Conn) {
-	//
+var (
+	pageMut      sync.RWMutex
+	pageResponse string
+	gmtLoc       = time.FixedZone("GMT", 0)
+)
+
+// pageChecker updates the pageResponse if the page file is changed
+/* TODO: Handle errors better */
+func pageChecker() {
+	f, err := os.Open(pageFileName)
+	if err != nil {
+		logger.Panic(err)
+	}
+	if fileBytes, err := ioutil.ReadFile(pageFileName); err != nil {
+		logger.Panic(err)
+	} else {
+		pageResponse = fmt.Sprintf(pageResponseTemplate, "%s", len(fileBytes), fileBytes)
+	}
+	stat, err := f.Stat()
+	if err != nil {
+		logger.Panic(err)
+	}
+	// Last mod time
+	l := stat.ModTime().Unix()
+	for {
+		if stat, err = f.Stat(); err != nil {
+			// Possibly close and reopen file
+			logger.Println(err)
+		} else if t := stat.ModTime().Unix(); t != l {
+			pageMut.Lock()
+			if fileBytes, err := ioutil.ReadFile(pageFileName); err != nil {
+				logger.Println(err)
+			} else {
+				pageResponse = fmt.Sprintf(pageResponseTemplate, "%s", len(fileBytes), fileBytes)
+			}
+		}
+		pageMut.Unlock()
+	}
 }
 
-// var urlRegex = regexp.MustCompile(`^(https?://[\w:\.]+)(/\w+)?`)
-var urlRegex = regexp.MustCompile(`^(https?://[\w:\.]+)`)
+/* IDEA: Allow path (and add arg to function) that allows ALL servers to be printed (even those without a site) */
+func servePage(conn net.Conn, all bool) {
+	// There will always be one, and only one, "%s" in the pageResponseFile
+	linksString := ""
+	serverConns.loopThru(func(iPath, iConn interface{}) bool {
+		path := iPath.(string)
+		server := iConn.(*ServerConn)
+		name := server.Name
+		if name == "" {
+			name = path
+		}
+		if server.Website || all {
+			linksString += fmt.Sprintf("<a href=%s>%s</a><br>", path, name)
+		}
+		return true
+	})
+	pageMut.RLock()
+	defer pageMut.RUnlock()
+	if _, err := fmt.Fprintf(conn, pageResponse, time.Now().In(gmtLoc).Format(time.RFC1123), linksString); err != nil {
+		logger.Println(err)
+	}
+}
 
 func listenForServers() {
-	/* TODO: Possilby send different codes for failures */
+	/* TODO: Make sure path is clean */
+	/* TODO: Make responses better */
+	/* Idea: Send different codes for failures */
 	serverLogger := log.New(os.Stdout, "Proxy Server: ", log.LstdFlags)
 	server := &http.Server{
 		Addr: internalIP + ":" + internalPort,
 		Handler: func() *http.ServeMux {
 			r := http.NewServeMux()
 			r.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+				// None used for GET
+				// path or addr used for DELETE
+				// path, addr, and name (optional) used for POST
 				path, name, addr, website := r.FormValue("path"), r.FormValue("name"), r.FormValue("addr"), false
-				/* TODO:
-				 * Don't need to parse for path, just need address
-				 * Need unique name specified for each new server (separate parameter)
-				 * Handle regex variable above
-				 * Handle regex results below
-				 */
-				u := r.FormValue("url")
-				if matches := urlRegex.FindStringSubmatch(u); matches == nil {
-					log.Panic("err")
-				}
 				if r.Method == http.MethodGet {
 					// Get list of servers
 					var servers []*ServerConn
@@ -301,15 +285,22 @@ func listenForServers() {
 				} else if r.Method == http.MethodDelete {
 					// Delete server
 					if path != "" {
-						serverConns.deleteByPath(path)
+						serverConns.delete(path)
 					} else if addr != "" {
-						serverConns.delete(addr)
+						serverConns.loopThru(func(iPath, iConn interface{}) bool {
+							if iConn.(*ServerConn).addr == addr {
+								serverConns.delete(iPath.(string))
+								return false
+							}
+							return true
+						})
 					} else {
 						http.Error(w, "Must provide 'addr' or 'path'", http.StatusBadRequest)
 						return
 					}
 					w.Write([]byte("success"))
 				} else if r.Method == http.MethodPost {
+					// Path can't be favicon.ico
 					if addr == "" || path == "" {
 						http.Error(w, "Must provide 'addr' and 'path'", http.StatusBadRequest)
 						return
@@ -317,11 +308,31 @@ func listenForServers() {
 					if r.FormValue("website") == "1" {
 						website = true
 					}
-					// Add new server, if path isn't already taken
-					if _, loaded := serverConns.loadOrStore(&ServerConn{path, name, website, addr, false}); loaded {
-						w.Write([]byte("failure"))
+					// Add new server, if path and name aren't already taken
+					server := &ServerConn{path, name, website, addr, false}
+					if _, loaded := serverConns.loadOrStore(server); loaded {
+						w.Write([]byte("path already exists"))
 					} else {
-						w.Write([]byte("success"))
+						nameExists := false
+						serverConns.loopThru(func(iPath, iConn interface{}) bool {
+							serv := iConn.(*ServerConn)
+							if serv.Name == "" {
+								return true
+							} else if serv.Name == server.Name {
+								if serv.Path == server.Path {
+									return true
+								}
+								nameExists = true
+								serverConns.delete(server.Path)
+								return false
+							}
+							return true
+						})
+						if nameExists {
+							w.Write([]byte("name already exists"))
+						} else {
+							w.Write([]byte("success"))
+						}
 					}
 				} else {
 					http.Error(w, "Invalid method", http.StatusMethodNotAllowed)
@@ -335,7 +346,7 @@ func listenForServers() {
 }
 
 func pinger() {
-	// Possibly use timer rather than this
+	/* IDEA: Use timer rather than this */
 	client := &http.Client{Timeout: time.Second}
 	start := time.Now().Add(time.Minute)
 	for {
