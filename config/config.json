@@ -1,5 +1,5 @@
 {
-  "ProxyAddr": "",
-  "ConnectorAddr": "",
+  "ProxyAddr": "localhost:8000",
+  "ConnectorAddr": "localhost:9000",
   "Password": ""
 }
