@@ -1,0 +1,18 @@
+{
+  "addr": "127.0.0.1:12345",
+  "forceShutdown": true,
+  "servers": [
+    {
+      "name": "server1",
+      "addr": "127.0.0.1:8001"
+    },
+    {
+      "name": "server2",
+      "addr": "127.0.0.1:8002"
+    },
+    {
+      "name": "server3",
+      "addr": "127.0.0.1:8003"
+    }
+  ]
+}
