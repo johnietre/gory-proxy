@@ -1,25 +1,58 @@
 package main
 
 /* Connecting tunnels
- * Message send by connecting attempting to connect:
-   * 2 byte header padding (31623, square root of the lowest number over a billion with a perfect square root)
-   * 1 byte server name length
-   * 1 byte password length
-   * Server name
-   * Password
- * Responses:
-   * 2 byte header padding (31623) on all responses
-   * Success:
-     * 1 byte success code (15)
-     * 1 byte message length (0)
-   * Invalid password:
-     * 1 byte success code (0)
-     * 1 byte message length (0)
-   * Error:
-     * 1 byte success code (13)
-     * 1 byte message length
-     * Error message
- */
+* Message sent by connecting attempting to connect:
+  * 2 byte header padding (31623, square root of the lowest number over a billion with a perfect square root)
+  * 1 byte server name length
+  * 1 byte password length
+  * Server name
+  * Password
+* Responses:
+  * 2 byte header padding (31623) on all responses
+  * Success:
+    * 1 byte success code (15)
+    * 1 byte message length (0)
+  * Invalid password:
+    * 1 byte invalid password code (0)
+    * 1 byte message length (0)
+  * Error:
+    * 1 byte error code (13)
+    * 1 byte message length
+    * Error message
+*/
+
+/* Executing commands from local machine or remote
+* Message sent to update server
+  * 2 byte header padding (3375)
+  * 2 byte message length
+  * 1 byte password length (no password required if client is local machine)
+  * 1 byte 0 pad
+  * Message (JSON)
+    * Action
+      * Add server
+      * Remove server
+      * Shutdown
+    * Contents
+      * Add server:
+        * ServerInfo struct as JSON
+      * Remove server:
+        * Server name
+      * Shutdown
+        * Shutdown timeout until force shutdown (if any)
+  * Password
+* Responses:
+  * 2 byte header padding (3375) on all responses
+  * Success
+    * 1 byte success code (15)
+    * 1 byte message length (0)
+  * Invalid password:
+    * 1 byte invalid password code (0)
+    * 1 byte message length (0)
+  * Error:
+    * 1 byte error code (13)
+    * 1 byte message length
+    * Error message
+*/
 
 import (
 	"bytes"
@@ -46,11 +79,13 @@ const (
 	reqBufferSize               = 2048
 	pipeBufferSize              = 1024
 	readDeadlineDuration        = time.Second
-  tunnelHeaderPadding = uint16(31623)
 	badRequestResponse          = "HTTP/1.1 400 Bad Request\r\n\r\n"
 	notFoundResponse            = "HTTP/1.1 404 Not Found\r\n\r\n"
 	internalServerErrorResponse = "HTTP/1.1 500 Internal Server Error\r\n\r\n"
-	gatewayTimeoutResponse = "HTTP/1.1 504 Gateway Timeout\r\n\r\n"
+	gatewayTimeoutResponse      = "HTTP/1.1 504 Gateway Timeout\r\n\r\n"
+  successResponseCode = 0xF
+  invalidPasswordResponseCode = 0x00
+  errorResponseCode = 0x0D
 )
 
 type ServerInfo struct {
@@ -65,7 +100,7 @@ type ProxyConfig struct {
 	ServerCertFilePath string       `json:"serverCertFilePath"`
 	ServerKeyFilePath  string       `json:"serverKeyFilePath"`
 	ClientCertFilePath string       `json:"clientCertFilePath"`
-	Tunnel             bool `json:"tunnel"`
+	Tunnel             bool         `json:"tunnel"`
 	Servers            []ServerInfo `json:"servers"`
 	Shutdown           bool         `json:"shutdown"`
 	ForceShutdown      bool         `json:"forceShutdown"`
@@ -73,13 +108,13 @@ type ProxyConfig struct {
 
 var (
 	configFilePath string
-  tunnelPassword string
+	tunnelPassword string
 
 	numRunning    int32
 	serverInfoMap sync.Map
 	ln            net.Listener
-  tunnelReqs uint32
-  tunnelChans sync.Map
+	tunnelReqs    uint32
+	tunnelChans   sync.Map
 	// TODO: Possibly keep "InsecureSkipVerify" as false
 	clientTLSConfig = &tls.Config{InsecureSkipVerify: true}
 	logger          = log.New(os.Stderr, "", log.LstdFlags|log.Lshortfile)
@@ -97,12 +132,12 @@ func init() {
 		"",
 		"The path to the proxy configuration file; uses $HOME/gory-proxy/config.json as default",
 	)
-  flag.StringVar(
-    &tunnelPassword,
-    "tunnel-password",
-    "",
-    "The password required for tunnels attempting to connect to the proxy or for connecting a tunnel to other proxies (max length 256 bytes)",
-  )
+	flag.StringVar(
+		&tunnelPassword,
+		"tunnel-password",
+		"",
+		"The password required for tunnels attempting to connect to the proxy or for connecting a tunnel to other proxies (max length 256 bytes)",
+	)
 	flag.Parse()
 }
 
@@ -201,20 +236,24 @@ func handleConn(client net.Conn) {
 	}
 	// Reset the read deadline
 	client.SetReadDeadline(time.Time{})
-  // Check if the request is a tunnel request
-  if n < 2 {
-    // Invalid request
-    client.Write([]byte(badRequestResponse))
-    return
-  } else {
-    // Check the first 2 bytes for the header
-    headerPadding := binary.BigEndian.Uint16(reqBuf[:2])
-    if headerPadding == tunnelHeaderPadding {
-      go createTunnel(client, reqBuf[2:])
+	// Check if the request is a tunnel request
+	if n < 2 {
+		// Invalid request
+		client.Write([]byte(badRequestResponse))
+		return
+	} else {
+		// Check the first 2 bytes for the header
+		header := binary.BigEndian.Uint16(reqBuf[:2])
+    if isTunnelHeader(header)
+			go createTunnel(client, reqBuf[2:])
+			*closeConn = false
+			return
+		} else if isCommandHeader(header) {
+      go serveCommand(client, reqBuf[2:])
       *closeConn = false
       return
     }
-  }
+	}
 	req := reqBuf[:n]
 	// Get the path from the request
 	parts := reqExpr.FindSubmatch(req)
@@ -250,7 +289,7 @@ func handleConn(client net.Conn) {
 		[]byte("\r\nForwarded: for"+client.RemoteAddr().String()+"\r\n\r\n"),
 		1,
 	)
-  // Handle tunnels appropriately
+	// Handle tunnels appropriately
 	serverInfo := iServerInfo.(ServerInfo)
 	if serverInfo.Tunnel {
 		go serveTunnel(client, req)
@@ -293,48 +332,118 @@ func serveFavicon(client net.Conn, req []byte) {
 func serveTunnel(client net.Conn, req []byte) {
 	atomic.AddInt32(&numRunning, 1)
 	defer atomic.AddInt32(&numRunning, -1)
-  tunnelID := atomic.AddUint32(&tunnelReqs, 1)
-  timeout := time.NewTimer(tunnelTimeout)
-  var server net.Conn
-  select {
-  case <-timeout.C:
-    // Write
-    client.Write([]byte(gatewayTimeoutResponse))
-    client.Close()
-    return
-  case server = <-tunnelConnChan:
-  }
-  go pipeConns(client, server)
-  go pipeConns(server, client)
+	tunnelID := atomic.AddUint32(&tunnelReqs, 1)
+	timeot := time.NewTimer(tunnelTimeout)
+	var server net.Conn
+	select {
+	case <-timeout.C:
+		// Write
+		client.Write([]byte(gatewayTimeoutResponse))
+		client.Close()
+		return
+	case server = <-tunnelConnChan:
+	}
+	go pipeConns(client, server)
+	go pipeConns(server, client)
 }
 
 func createTunnel(client net.Conn, req []byte) {
-  if len(req) < 2 {
-    // Send error, invalid request
-    resp := make([]byte, 4)
-    binary.BigEndian.PutUint16(resp, tunnelHeaderPadding)
-    client.Write(resp)
-    client.Close()
+  closeConn := new(bool)
+  *closeConn  = true
+  defer func() {
+    if *closeConn {
+      client.Close()
+    }
+  }()
+	if len(req) < 2 {
+		client.Write(errorResp(tunnelHeader(), "malformed request"))
+		return
+	}
+  // The site name  and password lengths
+  siteNameLen, passwordLen := req[0], req[1]
+	req = req[2:]
+	if len(req) != siteNameLen + passwordLen {
+		client.Write(errorResp(tunnelHeader(), "content length mismatch"))
+		return
+	}
+  // Check the password
+  if string(req[:siteNameLen]) != tunnelPassword {
+    client.Write(invaldPasswordResp(tunnelHeader()))
+		return
+	}
+  // Add the site name
+  siteName := string(req[siteNameLen:])
+  serverInfo := ServerInfo{Name: siteName, Tunnel: true}
+	if _, loaded := serverInfoMap.LoadOrStore(siteName, serverInfo); loaded {
+    client.Write(errorResp(tunnelHeader(), "server name already exists"))
     return
   }
-  lengths := binary.BigEndian.Uint16(req[:2])
-  req = req[2:]
-  if len(req) != lengths {
-    // Invalid request
-    client.Write(resp)
-    client.Close()
+  tunnel
+}
+
+type Command struct {
+  Action string `json:"action"`
+  ServerInfo ServerInfo `json:"serverInfo,omitempty"`
+  ShutdownTimeout int `json:"shutdownTimeout,omitempty"`
+}
+
+func serveCommand(client net.Conn, req []byte) {
+  defer client.Close()
+  resp := commandHeader()
+  if len(req) < 4 {
+    client.Write(errorResp(commandHeader(), "malformed request"))
     return
   }
-  siteNameLen := byte(lengths)
-  siteName := string(req[:siteNameLen])
-  passwordLen := lengths >> 8
-  password := string(req[siteNameLen:])
-  if password != tunnelPassword {
-    // Incorrect password
-    client.Close()
+  // The message and password lengths
+	msgLen, passwordLen := binary.BigEndian.Uint16(req[:2]), req[3]
+  req = req[4:] // 4 to remote the 1 byte 0 pad
+  if len(req) != msgLen + passwordLen {
+    client.Write(errorResp(commandHeader(), "content length mismatch"))
     return
   }
-  _, loaded := serverInfoMap
+  // Get the password if the connection is not from the local machine
+  host, _, _ := net.SplitHostPort(client.RemoteAddr().String())
+  if host != "127.0.0.1" {
+    if string(req[msgLen:]) != commandPassword {
+      client.Write(invalidPasswordResp(commandHeader())
+      return
+    }
+  }
+  // Get and execute the command
+  var command Command
+  if err := json.Unmarshal(req[:msgLen], &command); err != nil {
+    client.Write(errorResp(commandHeader(), "malformed request json"))
+    return
+  }
+  switch command.Action {
+  case "add":
+    serverInfo := command.ServerInfo
+    if serverInfo.Name == "" || serverInfo.Addr == "" {
+      client.Write(errorResp(commandHeader(), "invalid server info"))
+      return
+    } else if serverInfo.Tunnel {
+      client.Write(errorResp(commandHeader(), "cannot add tunnel server"))
+      return
+    }
+    if _, loaded := serverInfoMap.LoadOrStore(serverInfo.Name, serveInfo); loaded {
+      client.Write(errorResp(commandHeader(), "server name already exists"))
+      return
+    }
+  case "remove":
+    serverInfoMap.Delete(command.ServerInfo.Name)
+  case "shutdown":
+    if command.ShutdownTimeout > 0 {
+      time.AfterFunc(func() {
+        time.Sleep(time.Second*time.Duration(command.ShutdownTimeout))
+        logger.Fatal("shutdown timed out, forcefully shutting down")
+      })
+    }
+    ln.Close()
+  default:
+    client.Write(errorResp(commandHeader(), "invalid action: "+command.Action))
+    return
+  }
+  client.Write(commandHeader(), successResp)
 }
 
 func pipeConns(from, to net.Conn) {
@@ -410,7 +519,7 @@ func watchConfigFile(oldConfig *ProxyConfig) {
 		}
 		// Update the server infos
 		serverInfoMap.Range(func(name, iInfo interface{}) bool {
-      info := iInfo.(ServerInfo)
+			info := iInfo.(ServerInfo)
 			serverInfoMap.Delete(k)
 			return true
 		})
@@ -436,4 +545,33 @@ func readConfigFile(filePath string) (*ProxyConfig, error) {
 func errIsTimeout(err error) bool {
 	netErr, ok := err.(net.Error)
 	return ok && netErr.Timeout()
+}
+
+// Header constants
+func tunnelHeader() []byte {
+  return []byte{0x9B, 0x87}
+}
+
+func commandHeader() []byte {
+  return []byte{0x0D, 0x2F}
+}
+
+func isTunnelHeader(s []byte) bool {
+  return bytes.Equal(tunnelHeader(), s)
+}
+
+func isCommandHeader(s []byte) bool {
+  return bytes.Equal(commandHeader(), s)
+}
+
+func successResp(header []byte) []byte {
+  return append(header, []byte{0x0F, 0x00}...)
+}
+
+func invalidPasswordResp(header []byte) []byte {
+  return append(header, []byte{0x00, 0x00}...)
+}
+
+func errorResp(header []byte, msg string) []byte {
+  return append(append(header, []byte{0x0D, byte(len(msg))}...), msg...)
 }
