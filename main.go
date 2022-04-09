@@ -1,577 +1,567 @@
 package main
 
-/* Connecting tunnels
-* Message sent by connecting attempting to connect:
-  * 2 byte header padding (31623, square root of the lowest number over a billion with a perfect square root)
-  * 1 byte server name length
-  * 1 byte password length
-  * Server name
-  * Password
-* Responses:
-  * 2 byte header padding (31623) on all responses
-  * Success:
-    * 1 byte success code (15)
-    * 1 byte message length (0)
-  * Invalid password:
-    * 1 byte invalid password code (0)
-    * 1 byte message length (0)
-  * Error:
-    * 1 byte error code (13)
-    * 1 byte message length
-    * Error message
-*/
-
-/* Executing commands from local machine or remote
-* Message sent to update server
-  * 2 byte header padding (3375)
-  * 2 byte message length
-  * 1 byte password length (no password required if client is local machine)
-  * 1 byte 0 pad
-  * Message (JSON)
-    * Action
-      * Add server
-      * Remove server
-      * Shutdown
-    * Contents
-      * Add server:
-        * ServerInfo struct as JSON
-      * Remove server:
-        * Server name
-      * Shutdown
-        * Shutdown timeout until force shutdown (if any)
-  * Password
-* Responses:
-  * 2 byte header padding (3375) on all responses
-  * Success
-    * 1 byte success code (15)
-    * 1 byte message length (0)
-  * Invalid password:
-    * 1 byte invalid password code (0)
-    * 1 byte message length (0)
-  * Error:
-    * 1 byte error code (13)
-    * 1 byte message length
-    * Error message
-*/
-
 import (
-	"bytes"
-	"crypto/tls"
-	"crypto/x509"
+	"bufio"
+	"context"
 	"encoding/binary"
 	"encoding/json"
-	"errors"
 	"flag"
-	"io"
-	"io/ioutil"
+	"fmt"
+	"html/template"
 	"log"
 	"net"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path"
-	"regexp"
-	"sync"
+	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 )
 
-const (
-	network                     = "tcp4"
-	reqBufferSize               = 2048
-	pipeBufferSize              = 1024
-	readDeadlineDuration        = time.Second
-	badRequestResponse          = "HTTP/1.1 400 Bad Request\r\n\r\n"
-	notFoundResponse            = "HTTP/1.1 404 Not Found\r\n\r\n"
-	internalServerErrorResponse = "HTTP/1.1 500 Internal Server Error\r\n\r\n"
-	gatewayTimeoutResponse      = "HTTP/1.1 504 Gateway Timeout\r\n\r\n"
-  successResponseCode = 0xF
-  invalidPasswordResponseCode = 0x00
-  errorResponseCode = 0x0D
-)
+type RW = http.ResponseWriter
+type Req = *http.Request
 
-type ServerInfo struct {
-	Name   string `json:"name"`
-	Addr   string `json:"addr"`
-	Tunnel bool   `json:"tunnel"`
-	Secure bool   `json:"secure"`
-}
+const tunnelQueueLen uint32 = 1000
 
-type ProxyConfig struct {
-	Addr               string       `json:"addr"`
-	ServerCertFilePath string       `json:"serverCertFilePath"`
-	ServerKeyFilePath  string       `json:"serverKeyFilePath"`
-	ClientCertFilePath string       `json:"clientCertFilePath"`
-	Tunnel             bool         `json:"tunnel"`
-	Servers            []ServerInfo `json:"servers"`
-	Shutdown           bool         `json:"shutdown"`
-	ForceShutdown      bool         `json:"forceShutdown"`
-}
-
-var (
-	configFilePath string
-	tunnelPassword string
-
-	numRunning    int32
-	serverInfoMap sync.Map
-	ln            net.Listener
-	tunnelReqs    uint32
-	tunnelChans   sync.Map
-	// TODO: Possibly keep "InsecureSkipVerify" as false
-	clientTLSConfig = &tls.Config{InsecureSkipVerify: true}
-	logger          = log.New(os.Stderr, "", log.LstdFlags|log.Lshortfile)
-	reqExpr         = regexp.MustCompile(`^\w+ /([^/ ]+)?(/.+)? HTTP`)
-	reservedPaths   = map[string]func(net.Conn, []byte){
-		"":            serveHome,
-		"favicon.ico": serveFavicon,
-	}
-)
-
-func init() {
-	flag.StringVar(
-		&configFilePath,
-		"config-file-path",
-		"",
-		"The path to the proxy configuration file; uses $HOME/gory-proxy/config.json as default",
-	)
-	flag.StringVar(
-		&tunnelPassword,
-		"tunnel-password",
-		"",
-		"The password required for tunnels attempting to connect to the proxy or for connecting a tunnel to other proxies (max length 256 bytes)",
-	)
-	flag.Parse()
-}
+var logger = log.New(os.Stderr, "", log.LstdFlags|log.Lshortfile)
 
 func main() {
-	log.SetFlags(0)
-	// Load the config file
-	if configFilePath == "" {
-		configFilePath = path.Join(os.Getenv("HOME"), "gory-proxy", "config.json")
-	}
-	proxyConfig, err := readConfigFile(configFilePath)
-	if err != nil {
-		log.Fatalf("error reading config file: %v", err)
-	}
-	// Create listener
-	if proxyConfig.ServerCertFilePath != "" && proxyConfig.ServerKeyFilePath != "" {
-		// Create the TLS listener with given credentials
-		cert, err := tls.LoadX509KeyPair(
-			proxyConfig.ServerCertFilePath,
-			proxyConfig.ServerKeyFilePath,
-		)
-		if err != nil {
-			log.Fatal("fatal error loading X509 key pair: %v", err)
-		}
-		config := &tls.Config{Certificates: []tls.Certificate{cert}}
-		ln, err = tls.Listen(network, proxyConfig.Addr, config)
-	} else if proxyConfig.ServerCertFilePath == proxyConfig.ServerKeyFilePath {
-		// If they're equal, they're both empty
-		// Create a regular listener
-		ln, err = net.Listen(network, proxyConfig.Addr)
-	} else {
-		log.Fatal("if providing server PEM files, both must be included")
-	}
-	if err != nil {
-		log.Fatalf("fatal error creating proxy: %v", err)
-	}
-	// Load the client cert if given
-	if proxyConfig.ClientCertFilePath != "" {
-		roots := x509.NewCertPool()
-		if pemBytes, err := ioutil.ReadFile(proxyConfig.ClientCertFilePath); err != nil {
-			log.Fatalf("error reading client cert file: %v", err)
-		} else if !roots.AppendCertsFromPEM(pemBytes) {
-			log.Fatal("failed to parse client certificate")
-		}
-		clientTLSConfig.InsecureSkipVerify = false
-		clientTLSConfig.RootCAs = roots
-	}
-	// Load the server infos
-	for _, serverInfo := range proxyConfig.Servers {
-		serverInfoMap.Store(serverInfo.Name, serverInfo)
-	}
-	go watchConfigFile(proxyConfig)
-	// Listen for new connections
-	logger.Printf("starting proxy on %s", proxyConfig.Addr)
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			if !errors.Is(err, net.ErrClosed) {
-				logger.Printf("fatal error: %v", err)
-			} else {
-				logger.Print("proxy listener closed, shutting down")
-			}
-			break
-		}
-		go handleConn(conn)
-	}
-	logger.Print("waiting for processes to finish")
-	for atomic.LoadInt32(&numRunning) != 0 {
-	}
-	logger.Print("all processes finished")
-}
-
-func handleConn(client net.Conn) {
-	atomic.AddInt32(&numRunning, 1)
-	defer atomic.AddInt32(&numRunning, -1)
-	closeConn := new(bool)
-	*closeConn = true
-	defer func() {
-		if *closeConn {
-			client.Close()
-		}
-	}()
-
-	if err := client.SetReadDeadline(time.Now().Add(readDeadlineDuration)); err != nil {
-		// IDEA: Send error message to client?
-		logger.Printf("error setting read deadline: %v", err)
-		return
-	}
-	// Read the first line of the request
-	var reqBuf [reqBufferSize]byte
-	n, err := client.Read(reqBuf[:])
-	if err != nil {
-		if !errIsTimeout(err) && !errors.Is(err, io.EOF) {
-			logger.Printf("error reading request line: %v", err)
-		}
-		return
-	}
-	// Reset the read deadline
-	client.SetReadDeadline(time.Time{})
-	// Check if the request is a tunnel request
-	if n < 2 {
-		// Invalid request
-		client.Write([]byte(badRequestResponse))
-		return
-	} else {
-		// Check the first 2 bytes for the header
-		header := binary.BigEndian.Uint16(reqBuf[:2])
-    if isTunnelHeader(header)
-			go createTunnel(client, reqBuf[2:])
-			*closeConn = false
-			return
-		} else if isCommandHeader(header) {
-      go serveCommand(client, reqBuf[2:])
-      *closeConn = false
-      return
-    }
-	}
-	req := reqBuf[:n]
-	// Get the path from the request
-	parts := reqExpr.FindSubmatch(req)
-	if len(parts) == 0 {
-		// Invalid HTTP 1 request
-		client.Write([]byte(badRequestResponse))
-		return
-	}
-	siteName := string(parts[1])
-	// Check if the site name is reserved
-	serveFunc, ok := reservedPaths[siteName]
-	if ok {
-		serveFunc(client, req)
-		return
-	}
-	// Get the server/site info
-	iServerInfo, ok := serverInfoMap.Load(siteName)
-	if !ok {
-		// Site doesn't exist
-		client.Write([]byte(notFoundResponse))
-		return
-	}
-	// Remove the site name from the request URI
-	if req[bytes.IndexByte(req, '/')+len(siteName)+1] == '/' {
-		req = bytes.Replace(req, []byte(siteName+"/"), []byte{}, 1)
-	} else {
-		req = bytes.Replace(req, []byte(siteName), []byte{}, 1)
-	}
-	// Append the "Forwarded" header for servers that want client information
-	req = bytes.Replace(
-		req,
-		[]byte("\r\n\r\n"),
-		[]byte("\r\nForwarded: for"+client.RemoteAddr().String()+"\r\n\r\n"),
-		1,
+	var addr, tunnelAddr, name, path string
+	flag.StringVar(&addr, "addr", "127.0.0.1:8000", "Address to run the server on")
+	flag.StringVar(&tunnelAddr, "tunnel", "", "Address to connect tunnel to")
+	flag.StringVar(
+		&name,
+		"name",
+		"",
+		"Name of the server displayed on the tunneled-to proxy (must have tunnel flag",
 	)
-	// Handle tunnels appropriately
-	serverInfo := iServerInfo.(ServerInfo)
-	if serverInfo.Tunnel {
-		go serveTunnel(client, req)
-		*closeConn = false
-		return
-	}
-	// Connect to the server
-	var server net.Conn
-	if serverInfo.Secure {
-		server, err = tls.Dial(network, serverInfo.Addr, clientTLSConfig)
+	flag.StringVar(
+		&path,
+		"path",
+		"",
+		"Path of the server on the tunneled-to proxy (must have tunnel flag",
+	)
+	flag.Parse()
+
+	var (
+		r   *Router
+		err error
+	)
+	if tunnelAddr != "" {
+		if name == "" || path == "" {
+			fmt.Fprintln(os.Stderr, "must provide name and path when tunneling")
+			return
+		}
+		r, err = NewTunneledRouter(addr, tunnelAddr, name, path)
 	} else {
-		server, err = net.Dial(network, serverInfo.Addr)
+		r, err = NewRouter(addr)
 	}
 	if err != nil {
-		client.Write([]byte(internalServerErrorResponse))
-		logger.Printf("error connecting to server: %v", err)
+		logger.Fatal(err)
+	}
+	s := &http.Server{
+		Handler:  r,
+		ErrorLog: logger,
+	}
+	logger.Fatal(s.Serve(r))
+}
+
+type Router struct {
+	ln         net.Listener
+	acceptChan chan net.Conn
+	lnErr      error
+
+	routes SyncMap[string, *Server]
+
+	tunnelQueue [tunnelQueueLen]chan net.Conn
+	tunnelID    uint32
+
+	tunnelAddr   string
+	tunnelConn   net.Conn
+	tunnelServer *Server
+}
+
+func NewRouter(addr string) (*Router, error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	r := &Router{ln: ln, acceptChan: make(chan net.Conn, 5)}
+	for i := uint32(0); i < tunnelQueueLen; i++ {
+		r.tunnelQueue[i] = make(chan net.Conn)
+	}
+	go r.listen()
+	return r, nil
+}
+
+func NewTunneledRouter(addr, tunnelAddr, name, path string) (*Router, error) {
+	s := &Server{Name: name, Path: path}
+	// Connect to the tunnel
+	c, err := connectTunnel(tunnelAddr, s)
+	if err != nil {
+		return nil, err
+	}
+	// Create the router
+	r, err := NewRouter(addr)
+	if err == nil {
+		r.tunnelAddr = tunnelAddr
+		r.tunnelConn = c
+		r.tunnelServer = s
+		go r.listenTunnel()
+	}
+	return r, err
+}
+
+func (router *Router) ServeHTTP(w RW, r Req) {
+	// Get the base path slug
+	var baseSlug string
+	if i := strings.Index(r.URL.Path, "/"); i == -1 {
+		baseSlug = r.URL.Path
+	} else if i != 0 {
+		baseSlug = r.URL.Path[:i]
+	} else if i1 := strings.Index(r.URL.Path[1:], "/"); i1 != -1 {
+		baseSlug = r.URL.Path[1 : 1+i1]
+	} else {
+		baseSlug = r.URL.Path[1:]
+	}
+	if baseSlug == "" {
+		switch r.Method {
+		case http.MethodPost:
+			router.addServer(w, r)
+		case http.MethodDelete:
+			router.deleteServer(w, r)
+		default:
+			router.serveHome(w, r)
+		}
 		return
 	}
-	// Write the request to the server
-	if _, err := server.Write([]byte(req)); err != nil {
-		client.Write([]byte(internalServerErrorResponse))
-		logger.Printf("error writing request line to server: %v")
+	if server, ok := router.routes.Load(baseSlug); ok {
+		// TODO: Set "Forwarded" header
+		if r.URL.Path[0] == '/' {
+			baseSlug = "/" + baseSlug
+		}
+		r.URL.Path = strings.Replace(r.URL.Path, baseSlug, "", 1)
+		server.proxy.ServeHTTP(w, r)
 		return
 	}
-
-	// Pipe the client and server
-	*closeConn = false
-	go pipeConns(client, server)
-	go pipeConns(server, client)
+	w.WriteHeader(http.StatusNotFound)
 }
 
-func serveHome(client net.Conn, req []byte) {
-	client.Write([]byte(notFoundResponse))
-}
-
-func serveFavicon(client net.Conn, req []byte) {
-	client.Write([]byte(notFoundResponse))
-}
-
-func serveTunnel(client net.Conn, req []byte) {
-	atomic.AddInt32(&numRunning, 1)
-	defer atomic.AddInt32(&numRunning, -1)
-	tunnelID := atomic.AddUint32(&tunnelReqs, 1)
-	timeot := time.NewTimer(tunnelTimeout)
-	var server net.Conn
-	select {
-	case <-timeout.C:
-		// Write
-		client.Write([]byte(gatewayTimeoutResponse))
-		client.Close()
-		return
-	case server = <-tunnelConnChan:
-	}
-	go pipeConns(client, server)
-	go pipeConns(server, client)
-}
-
-func createTunnel(client net.Conn, req []byte) {
-  closeConn := new(bool)
-  *closeConn  = true
-  defer func() {
-    if *closeConn {
-      client.Close()
-    }
-  }()
-	if len(req) < 2 {
-		client.Write(errorResp(tunnelHeader(), "malformed request"))
+func (router *Router) addServer(w RW, r Req) {
+	defer r.Body.Close()
+	srvr := &Server{}
+	if err := json.NewDecoder(r.Body).Decode(srvr); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-  // The site name  and password lengths
-  siteNameLen, passwordLen := req[0], req[1]
-	req = req[2:]
-	if len(req) != siteNameLen + passwordLen {
-		client.Write(errorResp(tunnelHeader(), "content length mismatch"))
+	u, err := url.Parse(srvr.Addr)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || srvr.Path == "" || srvr.Name == "" {
+		logger.Println(err)
+		// TODO: Provide error messages
+		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-  // Check the password
-  if string(req[:siteNameLen]) != tunnelPassword {
-    client.Write(invaldPasswordResp(tunnelHeader()))
+	srvr.addProxy(httputil.NewSingleHostReverseProxy(u))
+	if _, loaded := router.routes.LoadOrStore(srvr.Path, srvr); loaded {
+		// TODO: Send different error w/ message
+		//w.WriteHeader(http.StatusBadRequest)
+		http.Error(w, "Server already exists", http.StatusBadRequest)
 		return
 	}
-  // Add the site name
-  siteName := string(req[siteNameLen:])
-  serverInfo := ServerInfo{Name: siteName, Tunnel: true}
-	if _, loaded := serverInfoMap.LoadOrStore(siteName, serverInfo); loaded {
-    client.Write(errorResp(tunnelHeader(), "server name already exists"))
-    return
-  }
-  tunnel
+	w.WriteHeader(http.StatusOK)
 }
 
-type Command struct {
-  Action string `json:"action"`
-  ServerInfo ServerInfo `json:"serverInfo,omitempty"`
-  ShutdownTimeout int `json:"shutdownTimeout,omitempty"`
-}
-
-func serveCommand(client net.Conn, req []byte) {
-  defer client.Close()
-  resp := commandHeader()
-  if len(req) < 4 {
-    client.Write(errorResp(commandHeader(), "malformed request"))
-    return
-  }
-  // The message and password lengths
-	msgLen, passwordLen := binary.BigEndian.Uint16(req[:2]), req[3]
-  req = req[4:] // 4 to remote the 1 byte 0 pad
-  if len(req) != msgLen + passwordLen {
-    client.Write(errorResp(commandHeader(), "content length mismatch"))
-    return
-  }
-  // Get the password if the connection is not from the local machine
-  host, _, _ := net.SplitHostPort(client.RemoteAddr().String())
-  if host != "127.0.0.1" {
-    if string(req[msgLen:]) != commandPassword {
-      client.Write(invalidPasswordResp(commandHeader())
-      return
-    }
-  }
-  // Get and execute the command
-  var command Command
-  if err := json.Unmarshal(req[:msgLen], &command); err != nil {
-    client.Write(errorResp(commandHeader(), "malformed request json"))
-    return
-  }
-  switch command.Action {
-  case "add":
-    serverInfo := command.ServerInfo
-    if serverInfo.Name == "" || serverInfo.Addr == "" {
-      client.Write(errorResp(commandHeader(), "invalid server info"))
-      return
-    } else if serverInfo.Tunnel {
-      client.Write(errorResp(commandHeader(), "cannot add tunnel server"))
-      return
-    }
-    if _, loaded := serverInfoMap.LoadOrStore(serverInfo.Name, serveInfo); loaded {
-      client.Write(errorResp(commandHeader(), "server name already exists"))
-      return
-    }
-  case "remove":
-    serverInfoMap.Delete(command.ServerInfo.Name)
-  case "shutdown":
-    if command.ShutdownTimeout > 0 {
-      time.AfterFunc(func() {
-        time.Sleep(time.Second*time.Duration(command.ShutdownTimeout))
-        logger.Fatal("shutdown timed out, forcefully shutting down")
-      })
-    }
-    ln.Close()
-  default:
-    client.Write(errorResp(commandHeader(), "invalid action: "+command.Action))
-    return
-  }
-  client.Write(commandHeader(), successResp)
-}
-
-func pipeConns(from, to net.Conn) {
-	atomic.AddInt32(&numRunning, 1)
-	defer atomic.AddInt32(&numRunning, -1)
-	defer from.Close()
-	for {
-		var buf [pipeBufferSize]byte
-		if n, err := from.Read(buf[:]); err != nil {
-			// Handle the error if it isn't an io.EOF or closed connection
-			if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
-				logger.Println(err)
-			}
-			// Close the other connection which will lead to the other instance
-			// of the function running to return
-			to.Close()
-			return
-		} else if _, err = to.Write(buf[:n]); err != nil {
-			if !errors.Is(err, net.ErrClosed) {
-				logger.Println(err)
-			}
-			return
-		}
+func (router *Router) deleteServer(w RW, r Req) {
+	defer r.Body.Close()
+	srvr := &Server{}
+	if err := json.NewDecoder(r.Body).Decode(srvr); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
 	}
+	s, ok := router.routes.Load(srvr.Path)
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	if srvr.Addr != s.Addr {
+		// TODO: Send better error
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	router.routes.Delete(srvr.Path)
+	if s.isTunnel {
+		s.tunnelConn.Close()
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
-func watchConfigFile(oldConfig *ProxyConfig) {
-	const timerDuration = time.Second * 30
-	lastModTime := time.Time{}
-	var timer *time.Timer
-	timer = time.AfterFunc(timerDuration, func() {
-		defer timer.Reset(timerDuration)
-		// Get the file data to see if it
-		info, err := os.Stat(configFilePath)
-		if err != nil {
-			logger.Fatalf("error reading config file stats: %v", err)
-		}
-		if !info.ModTime().After(lastModTime) {
-			return
-		}
-		// Read the config file
-		newConfig, err := readConfigFile(configFilePath)
-		if err != nil {
-			if _, ok := err.(*os.PathError); ok {
-				logger.Fatalf("error reading config file: %v", err)
-			}
-			logger.Printf("error parsing congif file: %v", err)
-			return
-		}
-		// Close the listener if specified
-		if newConfig.Shutdown {
-			ln.Close()
-			return
-		}
-		if newConfig.ForceShutdown {
-			logger.Fatal("forcing shutdown")
-		}
-		// Check to see if the length of the servers array is the same
-		if len(newConfig.Servers) == len(oldConfig.Servers) {
-			// Check to see if any other server infos are different
-			update := false
-			for i, serverInfo := range newConfig.Servers {
-				if serverInfo != oldConfig.Servers[i] {
-					update = true
-					break
-				}
-			}
-			// Don't continue if there doesn't need to be an update
-			if !update {
-				oldConfig = newConfig
-				return
-			}
-		}
-		// Update the server infos
-		serverInfoMap.Range(func(name, iInfo interface{}) bool {
-			info := iInfo.(ServerInfo)
-			serverInfoMap.Delete(k)
-			return true
-		})
-		for _, serverInfo := range newConfig.Servers {
-			serverInfoMap.Store(serverInfo.Name, serverInfo)
-		}
-		oldConfig = newConfig
+func (router *Router) serveHome(w RW, r Req) {
+	t, err := template.ParseFiles("index.html")
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		logger.Println(err)
+		return
+	}
+	parts := r.Header.Values("Gory-Proxy-Path")
+	var data []pageData
+	router.routes.Range(func(_ string, srvr *Server) bool {
+		data = append(data, srvr.ToPageData(parts))
+		return true
 	})
+	sort.Slice(data, func(i, j int) bool {
+		return data[i].Name < data[j].Name
+	})
+	if err := t.Execute(w, data); err != nil {
+		logger.Println(err)
+	}
 }
 
-func readConfigFile(filePath string) (*ProxyConfig, error) {
-	configFile, err := os.Open(filePath)
+func (router *Router) listen() {
+	for {
+		c, err := router.ln.Accept()
+		if err != nil {
+			router.lnErr = err
+			// TODO
+			//close(router.acceptChan)
+			return
+		}
+		go router.handleConn(c)
+	}
+}
+
+func (router *Router) handleConn(c net.Conn) {
+	// Check the error?
+	c.SetReadDeadline(time.Now().Add(time.Second * 30))
+	// Convert the conn into a buf conn and check for a tunnel req header
+	bc := NewBufConn(c)
+	h, err := bc.Peek(4)
+	// TODO: Log error?
+	if err != nil {
+		bc.Close()
+		return
+	}
+	if header := getHeader(h); header == HeaderConnect {
+		// Read 8 bytes: 4 for the header still in the buffer and 4 for the id
+		h = make([]byte, 8)
+		if n, err := bc.Read(h); err != nil {
+			// TODO: Log error?
+			bc.Close()
+			return
+		} else if n != 8 {
+			// TODO: Log someting?
+			bc.Close()
+			return
+		}
+		bc.SetReadDeadline(time.Time{})
+		index := binary.BigEndian.Uint32(h[4:]) % tunnelQueueLen
+		select {
+		case router.tunnelQueue[index] <- bc:
+		default:
+			// The one requesting the conn is no longer waiting for it
+			bc.Close()
+		}
+	} else if header == HeaderTunnel {
+		buf := make([]byte, 256)
+		n, err := bc.Read(buf)
+		if err != nil {
+			// TODO: Do something with error (or delete logging)
+			logger.Println("error reading from connecting tunnel proxy: %v", err)
+			bc.Close()
+			return
+		}
+		bc.SetReadDeadline(time.Time{})
+		s := &Server{}
+		// Start from 4 to get rid of the header bytes that were still in the buffer
+		if err := json.Unmarshal(buf[4:n], &s); err != nil || s.Name == "" || s.Path == "" {
+			if err != nil {
+				logger.Println(err)
+			}
+			// TODO: Do something with error?
+			bc.Write(headerBadMessageBytes)
+			bc.Close()
+			return
+		}
+		s.addProxy(router.newTunnelProxy(bc))
+		s.isTunnel = true
+		s.tunnelConn = bc
+		if _, loaded := router.routes.LoadOrStore(s.Path, s); loaded {
+			bc.Write(headerAlreadyExistsBytes)
+			bc.Close()
+		}
+		bc.Write(headerSuccessBytes)
+	} else {
+		bc.SetReadDeadline(time.Time{})
+		router.acceptChan <- bc
+	}
+}
+
+// Accept should only be called by the http package server
+func (router *Router) Accept() (net.Conn, error) {
+	c := <-router.acceptChan
+	if c == nil {
+		return nil, router.lnErr
+	}
+	return c, nil
+}
+
+func (router *Router) Close() error {
+	if router.tunnelConn != nil {
+		router.tunnelConn.Close()
+	}
+	return router.ln.Close()
+}
+
+func (router *Router) Addr() net.Addr {
+	return router.ln.Addr()
+}
+
+var tunnelURL = mustValue(url.Parse("http://0.0.0.0:0"))
+
+func (router *Router) newTunnelProxy(c net.Conn) *httputil.ReverseProxy {
+	p := httputil.NewSingleHostReverseProxy(tunnelURL)
+	transport := *http.DefaultTransport.(*http.Transport)
+	transport.DialContext = func(ctx context.Context, _ string, _ string) (net.Conn, error) {
+		id := router.nextID()
+		index := id % tunnelQueueLen
+		// Remove an old conn if one exists
+		select {
+		case old := <-router.tunnelQueue[index]:
+			old.Close()
+		default:
+		}
+		// TODO: Do something more with the error?
+		if _, err := c.Write(append(headerConnectBytes, put4(id)...)); err != nil {
+			return nil, fmt.Errorf("error getting tunnel connection: %w", err)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case tc := <-router.tunnelQueue[index]:
+			return tc, nil
+		}
+	}
+	p.Transport = &transport
+	return p
+}
+
+func (router *Router) listenTunnel() {
+	// TODO: Do something to signify the tunnel has been closed
+tunnelLoop:
+	for {
+		var buf [8]byte
+		// TODO: Log error?
+		if n, err := router.tunnelConn.Read(buf[:]); err != nil {
+			log.Println("tunnel disconnected")
+			for {
+				// TODO: Do more with error
+				c, err := connectTunnel(router.tunnelAddr, router.tunnelServer)
+				if err != nil {
+					// Return if the tunnel has been replaced on the tunneled-to server
+					if te, ok := err.(*TunnelError); ok && te.header == HeaderAlreadyExists {
+						return
+					}
+					router.tunnelConn = c
+					continue tunnelLoop
+				}
+				time.Sleep(time.Minute)
+			}
+			return
+		} else if n != 8 {
+			// TODO: Something?
+			continue
+		}
+		go router.handleTunnelConn(buf)
+	}
+}
+
+func (router *Router) handleTunnelConn(buf [8]byte) {
+	if getHeader(buf[:]) != HeaderConnect {
+		return
+	}
+	id := binary.BigEndian.Uint32(buf[4:])
+	// TODO: Log error?
+	// TODO: Dial with server dial options (or something)?
+	c, err := net.Dial("tcp", router.tunnelAddr)
+	if err != nil {
+		return
+	}
+	if _, err := c.Write(append(headerConnectBytes, put4(id)...)); err != nil {
+		c.Close()
+		return
+	}
+	// TODO: Do something if tunnel closed
+	router.acceptChan <- c
+}
+
+func (router *Router) nextID() uint32 {
+	return atomic.AddUint32(&router.tunnelID, 1)
+}
+
+type TunnelError struct {
+	header uint32
+	msg    string
+}
+
+func newTunnelError(header uint32, msg string) *TunnelError {
+	return &TunnelError{header: header, msg: msg}
+}
+
+func (e *TunnelError) Error() string {
+	return e.msg
+}
+
+func connectTunnel(addr string, s *Server) (net.Conn, error) {
+	c, err := net.Dial("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
-	config := &ProxyConfig{}
-	if err := json.NewDecoder(configFile).Decode(config); err != nil {
+	// Marshal and the send the server data, then wait for a response
+	buf, err := json.Marshal(s)
+	if err != nil {
+		c.Close()
 		return nil, err
 	}
-	return config, nil
+	if _, err := c.Write(append(headerTunnelBytes, buf...)); err != nil {
+		c.Close()
+		return nil, fmt.Errorf("error writing when connecting: %w", err)
+	} else if _, err := c.Read(buf); err != nil { // TODO: Use deadline?
+		c.Close()
+		return nil, fmt.Errorf("error reading when connecting: %w", err)
+	}
+	// Check the response
+	switch getHeader(buf) {
+	case HeaderSuccess:
+	case HeaderBadMessage:
+		c.Close()
+		return nil, newTunnelError(HeaderBadMessage, "bad name or path")
+	case HeaderAlreadyExists:
+		c.Close()
+		return nil, newTunnelError(
+			HeaderAlreadyExists, "name or path already exists on tunneled-to server")
+	default:
+		c.Close()
+		return nil, newTunnelError(HeaderNothing, "an error occurred")
+	}
+	return c, nil
 }
 
-func errIsTimeout(err error) bool {
-	netErr, ok := err.(net.Error)
-	return ok && netErr.Timeout()
+type Server struct {
+	Name string `json:"name,omitempty"`
+	Path string `json:"path,omitempty"`
+	Addr string `json:"addr,omitempty"`
+
+	proxy *httputil.ReverseProxy
+
+	isTunnel   bool
+	tunnelConn net.Conn
 }
 
-// Header constants
-func tunnelHeader() []byte {
-  return []byte{0x9B, 0x87}
+func (s *Server) addProxy(p *httputil.ReverseProxy) {
+	p.ErrorLog = logger
+	// The ReverseProxy will log an error if it's original director isn't called
+	if d := p.Director; d == nil {
+		p.Director = func(r *http.Request) {
+			r.Header.Add("Gory-Proxy-Path", s.Path)
+		}
+	} else {
+		p.Director = func(r *http.Request) {
+			r.Header.Add("Gory-Proxy-Path", s.Path)
+			d(r)
+		}
+	}
+	/*
+	  p.ModifyResponse = func(resp *http.Response) error {
+	    resp.Request.URL.Path = path.Join(s.Path, resp.Request.URL.Path)
+	    return nil
+	  }
+	*/
+	s.proxy = p
 }
 
-func commandHeader() []byte {
-  return []byte{0x0D, 0x2F}
+type pageData struct {
+	Name, Path string
 }
 
-func isTunnelHeader(s []byte) bool {
-  return bytes.Equal(tunnelHeader(), s)
+func (s *Server) ToPageData(parts []string) pageData {
+	return pageData{
+		Name: s.Name,
+		Path: path.Join(path.Join(parts...), s.Path),
+	}
 }
 
-func isCommandHeader(s []byte) bool {
-  return bytes.Equal(commandHeader(), s)
+type BufConn struct {
+	r *bufio.Reader
+	net.Conn
 }
 
-func successResp(header []byte) []byte {
-  return append(header, []byte{0x0F, 0x00}...)
+func NewBufConn(c net.Conn) BufConn {
+	return BufConn{bufio.NewReader(c), c}
 }
 
-func invalidPasswordResp(header []byte) []byte {
-  return append(header, []byte{0x00, 0x00}...)
+func (c BufConn) Peek(n int) ([]byte, error) {
+	return c.r.Peek(n)
 }
 
-func errorResp(header []byte, msg string) []byte {
-  return append(append(header, []byte{0x0D, byte(len(msg))}...), msg...)
+func (c BufConn) Read(p []byte) (int, error) {
+	return c.r.Read(p)
+}
+
+const (
+	// HeaderNothing represents no header
+	HeaderNothing uint32 = 0x0
+	// HeaderTunnel is the header used to create a new tunnel
+	HeaderTunnel uint32 = 0xFFFFFFFF
+	// HeaderConnect is used to connect a new conn to the tunnel
+	HeaderConnect uint32 = 0xFFFFFFFE
+	// HeaderSucess represents a successful action
+	HeaderSuccess uint32 = 0xFFFFFFFD
+	// HeaderBadMessage represents a bad message send
+	HeaderBadMessage uint32 = 0xFFFFFFFC
+	// HeaderAlreadyExists means the server already exists
+	HeaderAlreadyExists uint32 = 0xFFFFFFB
+)
+
+var (
+	headerTunnelBytes        = put4(HeaderTunnel)
+	headerConnectBytes       = put4(HeaderConnect)
+	headerSuccessBytes       = put4(HeaderSuccess)
+	headerBadMessageBytes    = put4(HeaderBadMessage)
+	headerAlreadyExistsBytes = put4(HeaderAlreadyExists)
+)
+
+func getHeader(p []byte) uint32 {
+	if len(p) < 4 {
+		return HeaderNothing
+	}
+	if p[0] == 255 && p[1] == 255 && p[2] == 255 {
+		switch p[3] {
+		case 0xFF:
+			return HeaderTunnel
+		case 0xFE:
+			return HeaderConnect
+		case 0xFD:
+			return HeaderSuccess
+		case 0xFC:
+			return HeaderBadMessage
+		case 0xFB:
+			return HeaderAlreadyExists
+		}
+	}
+	return HeaderNothing
+}
+
+func put4(u uint32) []byte {
+	b := make([]byte, 4)
+	binary.BigEndian.PutUint32(b, u)
+	return b
+}
+
+func mustValue[T any](v T, err error) T {
+	if err != nil {
+		panic(err)
+	}
+	return v
 }
