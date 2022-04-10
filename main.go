@@ -15,6 +15,8 @@ import (
 	"net/url"
 	"os"
 	"path"
+  "path/filepath"
+  "runtime"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -26,7 +28,23 @@ type Req = *http.Request
 
 const tunnelQueueLen uint32 = 1000
 
-var logger = log.New(os.Stderr, "", log.LstdFlags|log.Lshortfile)
+var (
+  logger = log.New(os.Stderr, "", log.LstdFlags|log.Lshortfile)
+  logFilePath string
+)
+
+func init() {
+  _, thisFile, _, ok := runtime.Caller(0)
+  if !ok {
+    logger.Fatal("error getting log directory")
+  }
+  logFilePath = filepath.Join(filepath.Dir(thisFile), "proxy.log")
+  f, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+  if err != nil {
+    logger.Fatal(err)
+  }
+  logger.SetOutput(f)
+}
 
 func main() {
 	var addr, tunnelAddr, name, path string
@@ -139,7 +157,10 @@ func (router *Router) ServeHTTP(w RW, r Req) {
 			router.serveHome(w, r)
 		}
 		return
-	}
+	} else if baseSlug == "log" {
+    router.serveLog(w, r)
+    return
+  }
 	if server, ok := router.routes.Load(baseSlug); ok {
 		// TODO: Set "Forwarded" header
 		if r.URL.Path[0] == '/' {
@@ -210,7 +231,9 @@ func (router *Router) serveHome(w RW, r Req) {
 	parts := r.Header.Values("Gory-Proxy-Path")
 	var data []pageData
 	router.routes.Range(func(_ string, srvr *Server) bool {
-		data = append(data, srvr.ToPageData(parts))
+    if !srvr.Hidden {
+      data = append(data, srvr.ToPageData(parts))
+    }
 		return true
 	})
 	sort.Slice(data, func(i, j int) bool {
@@ -221,11 +244,16 @@ func (router *Router) serveHome(w RW, r Req) {
 	}
 }
 
+func (router *Router) serveLog(w RW, r Req) {
+  http.ServeFile(w, r, logFilePath)
+}
+
 func (router *Router) listen() {
 	for {
 		c, err := router.ln.Accept()
 		if err != nil {
 			router.lnErr = err
+      logger.Println(err)
 			// TODO
 			//close(router.acceptChan)
 			return
@@ -336,6 +364,7 @@ func (router *Router) newTunnelProxy(c net.Conn) *httputil.ReverseProxy {
 		}
 		// TODO: Do something more with the error?
 		if _, err := c.Write(append(headerConnectBytes, put4(id)...)); err != nil {
+      // TODO: Remove the tunnel if it was disconnected?
 			return nil, fmt.Errorf("error getting tunnel connection: %w", err)
 		}
 		select {
@@ -455,6 +484,8 @@ type Server struct {
 	Name string `json:"name,omitempty"`
 	Path string `json:"path,omitempty"`
 	Addr string `json:"addr,omitempty"`
+  // Hold whether the server should be displayed on the site or not
+  Hidden bool `json:"hidden,omitempty"`
 
 	proxy *httputil.ReverseProxy
 
