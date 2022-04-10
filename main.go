@@ -55,6 +55,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, "must provide name and path when tunneling")
 			return
 		}
+    logger.Println("attempting tunneling to", tunnelAddr)
 		r, err = NewTunneledRouter(addr, tunnelAddr, name, path)
 	} else {
 		r, err = NewRouter(addr)
@@ -66,6 +67,7 @@ func main() {
 		Handler:  r,
 		ErrorLog: logger,
 	}
+  logger.Println("starting proxy on", addr)
 	logger.Fatal(s.Serve(r))
 }
 
@@ -363,9 +365,10 @@ tunnelLoop:
 					if te, ok := err.(*TunnelError); ok && te.header == HeaderAlreadyExists {
 						return
 					}
+				} else {
 					router.tunnelConn = c
 					continue tunnelLoop
-				}
+        }
 				time.Sleep(time.Minute)
 			}
 			return

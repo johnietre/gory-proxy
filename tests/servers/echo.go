@@ -1,12 +1,17 @@
 package main
 
 import (
+  "flag"
   "net/http"
   webs "golang.org/x/net/websocket"
 )
 
 func main() {
-  panic(http.ListenAndServe("127.0.0.1:7999", webs.Handler(handler)))
+  var addr string
+  flag.StringVar(&addr, "addr", ":8000", "Address to run on")
+  flag.Parse()
+  println("running on " + addr)
+  panic(http.ListenAndServe(addr, webs.Handler(handler)))
 }
 
 var (

@@ -12,9 +12,10 @@ import (
 func main() {
   srvr := Server{}
   log.SetFlags(0)
-  flag.StringVar(&srvr.Name, "name", "Main2", "Name of the server")
-  flag.StringVar(&srvr.Path, "path", "main2", "Path of the server")
-  flag.StringVar(&srvr.Addr, "addr", "http://127.0.0.1:8012", "Addr of the server")
+  flag.StringVar(&srvr.Name, "name", "Main", "Name of the server")
+  flag.StringVar(&srvr.Path, "path", "main", "Path of the server")
+  flag.StringVar(&srvr.Addr, "addr", "http://127.0.0.1:8001", "Addr of the server")
+  flag.StringVar(&proxyAddr, "proxy", "http://127.0.0.1:8000", "Address of the proxy server")
   flag.Parse()
 
   if srvr.Name == "" || srvr.Path == "" || srvr.Addr == "" {
@@ -22,7 +23,7 @@ func main() {
   }
   b := bytes.NewBuffer(nil)
   json.NewEncoder(b).Encode(srvr)
-  resp, err := http.Post("http://127.0.0.1:8080", "application/json", b)
+  resp, err := http.Post(proxyAddr, "application/json", b)
   if err != nil {
     log.Fatal(err)
   }

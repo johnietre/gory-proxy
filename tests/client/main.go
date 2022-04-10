@@ -8,12 +8,17 @@ import (
   "net/http"
 )
 
+var server string
+var del bool
+
 func main() {
   srvr := Server{}
   log.SetFlags(0)
   flag.StringVar(&srvr.Name, "name", "", "Name of the server")
   flag.StringVar(&srvr.Path, "path", "", "Path of the server")
   flag.StringVar(&srvr.Addr, "addr", "", "Addr of the server")
+  flag.StringVar(&server, "server", "127.0.01:8000", "Addr of the server to send to")
+  flag.BoolVar(&del, "del", false, "Send delete request")
   flag.Parse()
 
   if srvr.Name == "" || srvr.Path == "" || srvr.Addr == "" {
@@ -21,7 +26,17 @@ func main() {
   }
   b := bytes.NewBuffer(nil)
   json.NewEncoder(b).Encode(srvr)
-  resp, err := http.Post("http://127.0.0.1:8000/tunnel", "application/json", b)
+  var method string
+  if !del {
+    method = http.MethodPost
+  } else {
+    method = http.MethodDelete
+  }
+  req, err := http.NewRequest(method, "http://"+server, b)
+  if err != nil {
+    log.Fatal(err)
+  }
+  resp, err := http.DefaultClient.Do(req)
   if err != nil {
     log.Fatal(err)
   }
