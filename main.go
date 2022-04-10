@@ -47,21 +47,23 @@ func init() {
 }
 
 func main() {
-	var addr, tunnelAddr, name, path string
+  tunnelSrvr := &Server{}
+	var addr, tunnelAddr string
 	flag.StringVar(&addr, "addr", "127.0.0.1:8000", "Address to run the server on")
 	flag.StringVar(&tunnelAddr, "tunnel", "", "Address to connect tunnel to")
 	flag.StringVar(
-		&name,
+		&tunnelSrvr.Name,
 		"name",
 		"",
 		"Name of the server displayed on the tunneled-to proxy (must have tunnel flag",
 	)
 	flag.StringVar(
-		&path,
+		&tunnelSrvr.Path,
 		"path",
 		"",
 		"Path of the server on the tunneled-to proxy (must have tunnel flag",
 	)
+  flag.BoolVar(&tunnelSrvr.Hidden, "hidden", false, "Whether the tunnel server should be hidden")
 	flag.Parse()
 
 	var (
@@ -69,12 +71,12 @@ func main() {
 		err error
 	)
 	if tunnelAddr != "" {
-		if name == "" || path == "" {
+		if tunnelSrvr.Name == "" || tunnelSrvr.Path == "" {
 			fmt.Fprintln(os.Stderr, "must provide name and path when tunneling")
 			return
 		}
-    logger.Println("attempting tunneling to", tunnelAddr)
-		r, err = NewTunneledRouter(addr, tunnelAddr, name, path)
+    log.Println("attempting tunneling to", tunnelAddr)
+		r, err = NewTunneledRouter(addr, tunnelAddr, tunnelSrvr)
 	} else {
 		r, err = NewRouter(addr)
 	}
@@ -117,8 +119,7 @@ func NewRouter(addr string) (*Router, error) {
 	return r, nil
 }
 
-func NewTunneledRouter(addr, tunnelAddr, name, path string) (*Router, error) {
-	s := &Server{Name: name, Path: path}
+func NewTunneledRouter(addr, tunnelAddr string, s *Server) (*Router, error) {
 	// Connect to the tunnel
 	c, err := connectTunnel(tunnelAddr, s)
 	if err != nil {
