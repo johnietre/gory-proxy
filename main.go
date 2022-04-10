@@ -121,6 +121,7 @@ func NewRouter(addr string) (*Router, error) {
 
 func NewTunneledRouter(addr, tunnelAddr string, s *Server) (*Router, error) {
 	// Connect to the tunnel
+  s.Addr = "tunnel"
 	c, err := connectTunnel(tunnelAddr, s)
 	if err != nil {
 		return nil, err
@@ -178,20 +179,23 @@ func (router *Router) addServer(w RW, r Req) {
 	defer r.Body.Close()
 	srvr := &Server{}
 	if err := json.NewDecoder(r.Body).Decode(srvr); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
+    http.Error(w, "Bad json", http.StatusBadRequest)
 		return
 	}
 	u, err := url.Parse(srvr.Addr)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || srvr.Path == "" || srvr.Name == "" {
-		logger.Println(err)
-		// TODO: Provide error messages
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
+  if err != nil {
+    http.Error(w, "Bad server address", http.StatusBadRequest)
+    return
+  } else if u.Scheme != "http" && u.Scheme != "https" {
+    http.Error(w, "Invalid proto", http.StatusBadRequest)
+    return
+  } else if srvr.Path == "" || srvr.Name == "" {
+    http.Error(w, "Must include path and name", http.StatusBadRequest)
+    return
+  }
 	srvr.addProxy(httputil.NewSingleHostReverseProxy(u))
 	if _, loaded := router.routes.LoadOrStore(srvr.Path, srvr); loaded {
 		// TODO: Send different error w/ message
-		//w.WriteHeader(http.StatusBadRequest)
 		http.Error(w, "Server already exists", http.StatusBadRequest)
 		return
 	}
@@ -202,17 +206,16 @@ func (router *Router) deleteServer(w RW, r Req) {
 	defer r.Body.Close()
 	srvr := &Server{}
 	if err := json.NewDecoder(r.Body).Decode(srvr); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
+    http.Error(w, "Bad json", http.StatusBadRequest)
 		return
 	}
 	s, ok := router.routes.Load(srvr.Path)
 	if !ok {
-		w.WriteHeader(http.StatusNotFound)
+    http.Error(w, "Server does not exist", http.StatusNotFound)
 		return
 	}
 	if srvr.Addr != s.Addr {
-		// TODO: Send better error
-		w.WriteHeader(http.StatusBadRequest)
+    http.Error(w, "Bad request", http.StatusBadRequest)
 		return
 	}
 	router.routes.Delete(srvr.Path)
