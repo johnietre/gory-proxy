@@ -54,4 +54,5 @@ type Server struct {
   Name string `json:"name"`
   Path string `json:"path"`
   Addr string `json:"addr"`
+  Hidden bool `json:"hidden"`
 }

@@ -1,1 +1,2 @@
-gory-proxy
+bin/
+*.log

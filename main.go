@@ -85,7 +85,7 @@ func main() {
 		Handler:  r,
 		ErrorLog: logger,
 	}
-  logger.Println("starting proxy on", addr)
+  log.Println("starting proxy on", addr)
 	logger.Fatal(s.Serve(r))
 }
 
