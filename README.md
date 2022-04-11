@@ -6,3 +6,4 @@
 - Make more secure
 - Add way to reconnect tunnel
 - Refactor
+- Display log file in browser at /log endpoint
