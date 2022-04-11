@@ -4,6 +4,7 @@ import (
   "bytes"
   "encoding/json"
   "flag"
+  "io/ioutil"
   "log"
   "net/http"
 )
@@ -44,9 +45,10 @@ func main() {
   if err != nil {
     log.Fatal(err)
   }
+  body, _ := ioutil.ReadAll(resp.Body)
   // Check the response
   if resp.StatusCode != http.StatusOK {
-    log.Fatalf("received non-OK status: %s", resp.Status)
+    log.Fatalf("received non-OK status '%s' with body: %s", resp.Status, body)
   }
 }
 
