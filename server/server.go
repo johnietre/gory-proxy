@@ -1,11 +1,10 @@
-package main
+package server
 
 import (
 	"bufio"
 	"context"
 	"encoding/binary"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"html/template"
 	"log"
@@ -15,12 +14,12 @@ import (
 	"net/url"
 	"os"
 	"path"
-  "path/filepath"
-  "runtime"
 	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
+
+	jtutils "github.com/johnietre/utils/go"
 )
 
 type RW = http.ResponseWriter
@@ -29,74 +28,16 @@ type Req = *http.Request
 const tunnelQueueLen uint32 = 1000
 
 var (
-  logger = log.New(os.Stderr, "", log.LstdFlags|log.Lshortfile)
-  logFilePath string
+	Logger      = log.New(os.Stderr, "", log.LstdFlags|log.Lshortfile)
+	LogFilePath string
 )
-
-func init() {
-  _, thisFile, _, ok := runtime.Caller(0)
-  if !ok {
-    logger.Fatal("error getting log directory")
-  }
-  logFilePath = filepath.Join(filepath.Dir(thisFile), "proxy.log")
-  f, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-  if err != nil {
-    logger.Fatal(err)
-  }
-  logger.SetOutput(f)
-}
-
-func main() {
-  tunnelSrvr := &Server{}
-	var addr, tunnelAddr string
-	flag.StringVar(&addr, "addr", "127.0.0.1:8000", "Address to run the server on")
-	flag.StringVar(&tunnelAddr, "tunnel", "", "Address to connect tunnel to")
-	flag.StringVar(
-		&tunnelSrvr.Name,
-		"name",
-		"",
-		"Name of the server displayed on the tunneled-to proxy (must have tunnel flag",
-	)
-	flag.StringVar(
-		&tunnelSrvr.Path,
-		"path",
-		"",
-		"Path of the server on the tunneled-to proxy (must have tunnel flag",
-	)
-  flag.BoolVar(&tunnelSrvr.Hidden, "hidden", false, "Whether the tunnel server should be hidden")
-	flag.Parse()
-
-	var (
-		r   *Router
-		err error
-	)
-	if tunnelAddr != "" {
-		if tunnelSrvr.Name == "" || tunnelSrvr.Path == "" {
-			fmt.Fprintln(os.Stderr, "must provide name and path when tunneling")
-			return
-		}
-    log.Println("attempting tunneling to", tunnelAddr)
-		r, err = NewTunneledRouter(addr, tunnelAddr, tunnelSrvr)
-	} else {
-		r, err = NewRouter(addr)
-	}
-	if err != nil {
-		logger.Fatal(err)
-	}
-	s := &http.Server{
-		Handler:  r,
-		ErrorLog: logger,
-	}
-  log.Println("starting proxy on", addr)
-	logger.Fatal(s.Serve(r))
-}
 
 type Router struct {
 	ln         net.Listener
 	acceptChan chan net.Conn
 	lnErr      error
 
-	routes SyncMap[string, *Server]
+	routes jtutils.SyncMap[string, *Server]
 
 	tunnelQueue [tunnelQueueLen]chan net.Conn
 	tunnelID    uint32
@@ -104,6 +45,10 @@ type Router struct {
 	tunnelAddr   string
 	tunnelConn   net.Conn
 	tunnelServer *Server
+}
+
+func NewRouterHandler() *Router {
+	return &Router{}
 }
 
 func NewRouter(addr string) (*Router, error) {
@@ -121,7 +66,7 @@ func NewRouter(addr string) (*Router, error) {
 
 func NewTunneledRouter(addr, tunnelAddr string, s *Server) (*Router, error) {
 	// Connect to the tunnel
-  s.Addr = "tunnel"
+	s.Addr = "tunnel"
 	c, err := connectTunnel(tunnelAddr, s)
 	if err != nil {
 		return nil, err
@@ -137,6 +82,10 @@ func NewTunneledRouter(addr, tunnelAddr string, s *Server) (*Router, error) {
 	return r, err
 }
 
+func (r *Router) IsHandlerOnly() bool {
+	return r.ln == nil && r.acceptChan == nil
+}
+
 func (router *Router) ServeHTTP(w RW, r Req) {
 	// Get the base path slug
 	var baseSlug string
@@ -149,20 +98,22 @@ func (router *Router) ServeHTTP(w RW, r Req) {
 	} else {
 		baseSlug = r.URL.Path[1:]
 	}
-	if baseSlug == "" {
-		switch r.Method {
-		case http.MethodPost:
-			router.addServer(w, r)
-		case http.MethodDelete:
-			router.deleteServer(w, r)
-		default:
-			router.serveHome(w, r)
+	if !router.IsHandlerOnly() {
+		if baseSlug == "" {
+			switch r.Method {
+			case http.MethodPost:
+				router.addServer(w, r)
+			case http.MethodDelete:
+				router.deleteServer(w, r)
+			default:
+				router.serveHome(w, r)
+			}
+			return
+		} else if baseSlug == "log" {
+			router.serveLog(w, r)
+			return
 		}
-		return
-	} else if baseSlug == "log" {
-    router.serveLog(w, r)
-    return
-  }
+	}
 	if server, ok := router.routes.Load(baseSlug); ok {
 		// TODO: Set "Forwarded" header
 		if r.URL.Path[0] == '/' {
@@ -175,25 +126,66 @@ func (router *Router) ServeHTTP(w RW, r Req) {
 	w.WriteHeader(http.StatusNotFound)
 }
 
+var (
+	ErrServerExists  = fmt.Errorf("server already exists")
+	ErrNoServerProxy = fmt.Errorf("server must have proxy")
+)
+
+func (router *Router) AddServer(srvr *Server) error {
+	if srvr.Path == "" || srvr.Name == "" {
+		return fmt.Errorf("must have server name and path")
+	} else if srvr.proxy == nil {
+		return ErrNoServerProxy
+	} else if _, loaded := router.routes.LoadOrStore(srvr.Path, srvr.Clone()); loaded {
+		return ErrServerExists
+	}
+	return nil
+}
+
+var (
+	ErrServerNotExist = fmt.Errorf("server does not exist")
+	ErrMismatchAddr   = fmt.Errorf("mistmatch addresses")
+)
+
+func (router *Router) DeleteServer(srvr *Server) error {
+	s, ok := router.routes.Load(srvr.Path)
+	if !ok {
+		return ErrServerNotExist
+	} else if srvr.Addr != s.Addr {
+		return ErrMismatchAddr
+	}
+	router.routes.Delete(srvr.Path)
+	return nil
+}
+
+func (router *Router) GetServers() map[string]*Server {
+	srvrs := make(map[string]*Server)
+	router.routes.Range(func(path string, srvr *Server) bool {
+		srvrs[path] = srvr.Clone()
+		return true
+	})
+	return srvrs
+}
+
 func (router *Router) addServer(w RW, r Req) {
 	defer r.Body.Close()
 	srvr := &Server{}
 	if err := json.NewDecoder(r.Body).Decode(srvr); err != nil {
-    http.Error(w, "Bad json", http.StatusBadRequest)
+		http.Error(w, "Bad json", http.StatusBadRequest)
 		return
 	}
 	u, err := url.Parse(srvr.Addr)
-  if err != nil {
-    http.Error(w, "Bad server address", http.StatusBadRequest)
-    return
-  } else if u.Scheme != "http" && u.Scheme != "https" {
-    http.Error(w, "Invalid proto", http.StatusBadRequest)
-    return
-  } else if srvr.Path == "" || srvr.Name == "" {
-    http.Error(w, "Must include path and name", http.StatusBadRequest)
-    return
-  }
-	srvr.addProxy(httputil.NewSingleHostReverseProxy(u))
+	if err != nil {
+		http.Error(w, "Bad server address", http.StatusBadRequest)
+		return
+	} else if u.Scheme != "http" && u.Scheme != "https" {
+		http.Error(w, "Invalid proto", http.StatusBadRequest)
+		return
+	} else if srvr.Path == "" || srvr.Name == "" {
+		http.Error(w, "Must include path and name", http.StatusBadRequest)
+		return
+	}
+	srvr.AddProxy(httputil.NewSingleHostReverseProxy(u))
 	if _, loaded := router.routes.LoadOrStore(srvr.Path, srvr); loaded {
 		// TODO: Send different error w/ message
 		http.Error(w, "Server already exists", http.StatusBadRequest)
@@ -206,16 +198,16 @@ func (router *Router) deleteServer(w RW, r Req) {
 	defer r.Body.Close()
 	srvr := &Server{}
 	if err := json.NewDecoder(r.Body).Decode(srvr); err != nil {
-    http.Error(w, "Bad json", http.StatusBadRequest)
+		http.Error(w, "Bad json", http.StatusBadRequest)
 		return
 	}
 	s, ok := router.routes.Load(srvr.Path)
 	if !ok {
-    http.Error(w, "Server does not exist", http.StatusNotFound)
+		http.Error(w, "Server does not exist", http.StatusNotFound)
 		return
 	}
 	if srvr.Addr != s.Addr {
-    http.Error(w, "Bad request", http.StatusBadRequest)
+		http.Error(w, "Bad request", http.StatusBadRequest)
 		return
 	}
 	router.routes.Delete(srvr.Path)
@@ -229,27 +221,27 @@ func (router *Router) serveHome(w RW, r Req) {
 	t, err := template.ParseFiles("index.html")
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
-		logger.Println(err)
+		Logger.Println(err)
 		return
 	}
 	parts := r.Header.Values("Gory-Proxy-Path")
 	var data []pageData
 	router.routes.Range(func(_ string, srvr *Server) bool {
-    if !srvr.Hidden {
-      data = append(data, srvr.ToPageData(parts))
-    }
+		if !srvr.Hidden {
+			data = append(data, srvr.ToPageData(parts))
+		}
 		return true
 	})
 	sort.Slice(data, func(i, j int) bool {
 		return data[i].Name < data[j].Name
 	})
 	if err := t.Execute(w, data); err != nil {
-		logger.Println(err)
+		Logger.Println(err)
 	}
 }
 
 func (router *Router) serveLog(w RW, r Req) {
-  http.ServeFile(w, r, logFilePath)
+	http.ServeFile(w, r, LogFilePath)
 }
 
 func (router *Router) listen() {
@@ -257,7 +249,7 @@ func (router *Router) listen() {
 		c, err := router.ln.Accept()
 		if err != nil {
 			router.lnErr = err
-      logger.Println(err)
+			Logger.Println(err)
 			// TODO
 			//close(router.acceptChan)
 			return
@@ -302,7 +294,7 @@ func (router *Router) handleConn(c net.Conn) {
 		n, err := bc.Read(buf)
 		if err != nil {
 			// TODO: Do something with error (or delete logging)
-			logger.Println("error reading from connecting tunnel proxy: %v", err)
+			Logger.Printf("error reading from connecting tunnel proxy: %v", err)
 			bc.Close()
 			return
 		}
@@ -311,14 +303,14 @@ func (router *Router) handleConn(c net.Conn) {
 		// Start from 4 to get rid of the header bytes that were still in the buffer
 		if err := json.Unmarshal(buf[4:n], &s); err != nil || s.Name == "" || s.Path == "" {
 			if err != nil {
-				logger.Println(err)
+				Logger.Println(err)
 			}
 			// TODO: Do something with error?
 			bc.Write(headerBadMessageBytes)
 			bc.Close()
 			return
 		}
-		s.addProxy(router.newTunnelProxy(bc))
+		s.AddProxy(router.newTunnelProxy(bc))
 		s.isTunnel = true
 		s.tunnelConn = bc
 		if _, loaded := router.routes.LoadOrStore(s.Path, s); loaded {
@@ -368,7 +360,7 @@ func (router *Router) newTunnelProxy(c net.Conn) *httputil.ReverseProxy {
 		}
 		// TODO: Do something more with the error?
 		if _, err := c.Write(append(headerConnectBytes, put4(id)...)); err != nil {
-      // TODO: Remove the tunnel if it was disconnected?
+			// TODO: Remove the tunnel if it was disconnected?
 			return nil, fmt.Errorf("error getting tunnel connection: %w", err)
 		}
 		select {
@@ -401,7 +393,7 @@ tunnelLoop:
 				} else {
 					router.tunnelConn = c
 					continue tunnelLoop
-        }
+				}
 				time.Sleep(time.Minute)
 			}
 			return
@@ -488,8 +480,8 @@ type Server struct {
 	Name string `json:"name,omitempty"`
 	Path string `json:"path,omitempty"`
 	Addr string `json:"addr,omitempty"`
-  // Hold whether the server should be displayed on the site or not
-  Hidden bool `json:"hidden,omitempty"`
+	// Hold whether the server should be displayed on the site or not
+	Hidden bool `json:"hidden,omitempty"`
 
 	proxy *httputil.ReverseProxy
 
@@ -497,8 +489,35 @@ type Server struct {
 	tunnelConn net.Conn
 }
 
-func (s *Server) addProxy(p *httputil.ReverseProxy) {
-	p.ErrorLog = logger
+func (s *Server) Clone() *Server {
+	return &Server{
+		Name:     s.Name,
+		Path:     s.Path,
+		Addr:     s.Addr,
+		Hidden:   s.Hidden,
+		isTunnel: s.isTunnel,
+	}
+}
+
+func (s *Server) AddNewProxy(addr string) error {
+	u, err := url.Parse(addr)
+	if err != nil {
+		return err
+	}
+	s.AddNewProxyWithURL(u)
+	return nil
+}
+
+func (s *Server) AddNewProxyWithURL(u *url.URL) {
+	s.AddProxy(httputil.NewSingleHostReverseProxy(u))
+}
+
+func (s *Server) Proxy() *httputil.ReverseProxy {
+	return s.proxy
+}
+
+func (s *Server) AddProxy(p *httputil.ReverseProxy) {
+	p.ErrorLog = Logger
 	// The ReverseProxy will log an error if it's original director isn't called
 	if d := p.Director; d == nil {
 		p.Director = func(r *http.Request) {
