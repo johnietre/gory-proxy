@@ -348,7 +348,7 @@ var tunnelURL = mustValue(url.Parse("http://0.0.0.0:0"))
 
 func (router *Router) newTunnelProxy(c net.Conn) *httputil.ReverseProxy {
 	p := httputil.NewSingleHostReverseProxy(tunnelURL)
-	transport := *http.DefaultTransport.(*http.Transport)
+	transport := http.DefaultTransport.(*http.Transport)
 	transport.DialContext = func(ctx context.Context, _ string, _ string) (net.Conn, error) {
 		id := router.nextID()
 		index := id % tunnelQueueLen
@@ -370,7 +370,7 @@ func (router *Router) newTunnelProxy(c net.Conn) *httputil.ReverseProxy {
 			return tc, nil
 		}
 	}
-	p.Transport = &transport
+	p.Transport = transport
 	return p
 }
 
@@ -495,6 +495,7 @@ func (s *Server) Clone() *Server {
 		Path:     s.Path,
 		Addr:     s.Addr,
 		Hidden:   s.Hidden,
+		proxy:    s.proxy,
 		isTunnel: s.isTunnel,
 	}
 }
