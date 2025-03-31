@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -51,6 +52,10 @@ func makeServerCmd() *cobra.Command {
 		"Path of the server on the tunneled-to proxy (must have tunnel flag",
 	)
 	flags.Bool("hidden", false, "Whether the tunnel server should be hidden")
+	flags.String("cert", "", "Path to cert file for TLS")
+	flags.String("key", "", "Path to key file for TLS")
+	cmd.MarkFlagsRequiredTogether("cert", "key")
+	cmd.MarkFlagsRequiredTogether("name", "path")
 
 	return cmd
 }
@@ -74,6 +79,16 @@ func runServer(cmd *cobra.Command, _ []string) {
 		Name: jtutils.Must(flags.GetString("name")),
 		Path: jtutils.Must(flags.GetString("path")),
 	}
+	certPath := jtutils.Must(flags.GetString("cert"))
+	keyPath := jtutils.Must(flags.GetString("key"))
+
+	if keyPath != "" {
+		if _, err := os.Stat(keyPath); err != nil {
+			log.Fatal("error checking key file: ", err)
+		} else if _, err = os.Stat(certPath); err != nil {
+			log.Fatal("error checking cert file: ", err)
+		}
+	}
 
 	var r *server.Router
 	if tunnelAddr != "" {
@@ -94,7 +109,11 @@ func runServer(cmd *cobra.Command, _ []string) {
 		ErrorLog: server.Logger,
 	}
 	log.Println("starting proxy on", addr)
-	server.Logger.Fatal(s.Serve(r))
+	if keyPath != "" {
+		server.Logger.Fatal(s.ServeTLS(r, certPath, keyPath))
+	} else {
+		server.Logger.Fatal(s.Serve(r))
+	}
 }
 
 func makeClientCmd() *cobra.Command {
@@ -109,8 +128,12 @@ func makeClientCmd() *cobra.Command {
 	flags.String("path", "", "Path of the server")
 	flags.String("addr", "", "Addr of the server (include proto)")
 	flags.Bool("hidden", false, "Whether the server is hidden or not")
-	flags.String("server", "127.0.01:8000", "Addr of the server to send to")
+	flags.String("server", "127.0.01:8000", "Addr of the server to send to (include proto)")
 	flags.Bool("del", false, "Send delete request")
+	flags.Bool("skip-verify", false, "Skip verifying server's certificate")
+	cmd.MarkFlagRequired("name")
+	cmd.MarkFlagRequired("path")
+	cmd.MarkFlagRequired("addr")
 
 	return cmd
 }
@@ -133,6 +156,7 @@ func runClient(cmd *cobra.Command, _ []string) {
 	}
 	server := jtutils.Must(flags.GetString("server"))
 	del := jtutils.Must(flags.GetBool("del"))
+	skipVerify := jtutils.Must(flags.GetBool("skip-verify"))
 
 	if srvr.Name == "" || srvr.Path == "" || srvr.Addr == "" {
 		log.Fatal("must provide name, path, and addr")
@@ -152,7 +176,19 @@ func runClient(cmd *cobra.Command, _ []string) {
 		log.Fatal(err)
 	}
 	// Sendn the request and get the response
-	resp, err := http.DefaultClient.Do(req)
+	var client *http.Client
+	if skipVerify {
+		client = &http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{
+					InsecureSkipVerify: true,
+				},
+			},
+		}
+	} else {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		log.Fatal(err)
 	}
