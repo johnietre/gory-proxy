@@ -1,4 +1,4 @@
-package server
+package goryproxy
 
 import (
 	"bufio"
@@ -28,10 +28,14 @@ type Req = *http.Request
 const tunnelQueueLen uint32 = 1000
 
 var (
-	Logger      = log.New(os.Stderr, "", log.LstdFlags|log.Lshortfile)
+	// Logger is the logger used.
+	Logger = log.New(os.Stderr, "", log.LstdFlags|log.Lshortfile)
+	// LogFilePath is used to serve a log file if a file is logged to.
 	LogFilePath string
 )
 
+// Router is a proxy router used to proxy connections. It can be used as a
+// server as well as an http.Handler.
 type Router struct {
 	ln         net.Listener
 	acceptChan chan net.Conn
@@ -47,10 +51,13 @@ type Router struct {
 	tunnelServer *Server
 }
 
+// NewRouterHandler creates a new Router to be used solely as an http.Handler.
 func NewRouterHandler() *Router {
 	return &Router{}
 }
 
+// NewRouter creates a new Router which listens on the given addr. It can also
+// be used as an http.Handler.
 func NewRouter(addr string) (*Router, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -64,6 +71,20 @@ func NewRouter(addr string) (*Router, error) {
 	return r, nil
 }
 
+// RouterFromListener creates a new Router with the given `ln`. It can also be
+// used as an http.Handler.
+func RouterFromListener(ln net.Listener) *Router {
+	r := &Router{ln: ln, acceptChan: make(chan net.Conn, 5)}
+	for i := uint32(0); i < tunnelQueueLen; i++ {
+		r.tunnelQueue[i] = make(chan net.Conn)
+	}
+	go r.listen()
+	return r
+}
+
+// NewTunneledRouter creates a new Router which listens on the given addr
+// and tunnels to the given tunnelAddr. The passed Server `s` is the server
+// used for the tunneled-to proxy. It can also be used as an http.Handler.
 func NewTunneledRouter(addr, tunnelAddr string, s *Server) (*Router, error) {
 	// Connect to the tunnel
 	s.Addr = "tunnel"
@@ -82,10 +103,35 @@ func NewTunneledRouter(addr, tunnelAddr string, s *Server) (*Router, error) {
 	return r, err
 }
 
+// TunneledRouterFromListener creates a new Router with the given `ln` and
+// tunnels to the given tunnelAddr. The passed Server `s` is the server used
+// for the tunneled-to proxy. It can also be used as an http.Handler.
+func TunneledRouterFromListener(
+	ln net.Listener,
+	tunnelAddr string,
+	s *Server,
+) (*Router, error) {
+	// Connect to the tunnel
+	s.Addr = "tunnel"
+	c, err := connectTunnel(tunnelAddr, s)
+	if err != nil {
+		return nil, err
+	}
+	// Create the router
+	r := RouterFromListener(ln)
+	r.tunnelAddr = tunnelAddr
+	r.tunnelConn = c
+	r.tunnelServer = s
+	go r.listenTunnel()
+	return r, nil
+}
+
+// IsHandlerOnly returns whether the proxy can only be used as a handler.
 func (r *Router) IsHandlerOnly() bool {
 	return r.ln == nil && r.acceptChan == nil
 }
 
+// ServeHTTP implements the http.Handler interface.
 func (router *Router) ServeHTTP(w RW, r Req) {
 	// Get the base path slug
 	var baseSlug string
@@ -127,10 +173,15 @@ func (router *Router) ServeHTTP(w RW, r Req) {
 }
 
 var (
-	ErrServerExists  = fmt.Errorf("server already exists")
+	// ErrServerExists is returned when trying to add a server that already
+	// exists.
+	ErrServerExists = fmt.Errorf("server already exists")
+	// ErrNoServerProxy is returned when trying to add a server that doesn't
+	// have an attached proxy.
 	ErrNoServerProxy = fmt.Errorf("server must have proxy")
 )
 
+// AddServer adds a server (i.e., a new path) to the proxy.
 func (router *Router) AddServer(srvr *Server) error {
 	if srvr.Path == "" || srvr.Name == "" {
 		return fmt.Errorf("must have server name and path")
@@ -143,10 +194,17 @@ func (router *Router) AddServer(srvr *Server) error {
 }
 
 var (
+	// ErrServerNotExist is returned when trying to remove a server that doesn't
+	// exist.
 	ErrServerNotExist = fmt.Errorf("server does not exist")
-	ErrMismatchAddr   = fmt.Errorf("mistmatch addresses")
+	// ErrMismatchAddr is returned when the addr of a server to delete doesn't
+	// match the one stored.
+	ErrMismatchAddr = fmt.Errorf("mistmatch addresses")
 )
 
+// DeleteServer removes a server from the proxy. The server passed doesn't need
+// to be the one stored by the proxy, but must have the same Path and Addr as
+// the one to delete.
 func (router *Router) DeleteServer(srvr *Server) error {
 	s, ok := router.routes.Load(srvr.Path)
 	if !ok {
@@ -158,6 +216,7 @@ func (router *Router) DeleteServer(srvr *Server) error {
 	return nil
 }
 
+// GetServers returns clones of the stored servers.
 func (router *Router) GetServers() map[string]*Server {
 	srvrs := make(map[string]*Server)
 	router.routes.Range(func(path string, srvr *Server) bool {
@@ -218,12 +277,15 @@ func (router *Router) deleteServer(w RW, r Req) {
 }
 
 func (router *Router) serveHome(w RW, r Req) {
-	t, err := template.ParseFiles("index.html")
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		Logger.Println(err)
-		return
-	}
+	/*
+		//t, err := template.ParseFiles("index.html")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			Logger.Println(err)
+			return
+		}
+	*/
+	t := tmpl
 	parts := r.Header.Values("Gory-Proxy-Path")
 	var data []pageData
 	router.routes.Range(func(_ string, srvr *Server) bool {
@@ -324,8 +386,11 @@ func (router *Router) handleConn(c net.Conn) {
 	}
 }
 
-// Accept should only be called by the http package server
+// Accept should only be called by the http package server.
 func (router *Router) Accept() (net.Conn, error) {
+	if router.acceptChan == nil {
+		return nil, fmt.Errorf("router is handler only")
+	}
 	c := <-router.acceptChan
 	if c == nil {
 		return nil, router.lnErr
@@ -333,14 +398,22 @@ func (router *Router) Accept() (net.Conn, error) {
 	return c, nil
 }
 
+// Close is used to close the proxy.
 func (router *Router) Close() error {
 	if router.tunnelConn != nil {
 		router.tunnelConn.Close()
 	}
+	if router.ln == nil {
+		return nil
+	}
 	return router.ln.Close()
 }
 
+// Addr returns the address of the proxy's listener.
 func (router *Router) Addr() net.Addr {
+	if router.ln == nil {
+		return nil
+	}
 	return router.ln.Addr()
 }
 
@@ -396,7 +469,6 @@ tunnelLoop:
 				}
 				time.Sleep(time.Minute)
 			}
-			return
 		} else if n != 8 {
 			// TODO: Something?
 			continue
@@ -476,9 +548,14 @@ func connectTunnel(addr string, s *Server) (net.Conn, error) {
 	return c, nil
 }
 
+// Server is a proxied-to server. To add a server to the router, a proxy
+// must be attached with AddNewProxy, AddNewProxyWithURL, or AddProxy.
 type Server struct {
+	// Name is the display name for the server.
 	Name string `json:"name,omitempty"`
+	// Path is the unique path the server is accessible from through the router.
 	Path string `json:"path,omitempty"`
+	// Addr is the address of the server.
 	Addr string `json:"addr,omitempty"`
 	// Hold whether the server should be displayed on the site or not
 	Hidden bool `json:"hidden,omitempty"`
@@ -489,6 +566,7 @@ type Server struct {
 	tunnelConn net.Conn
 }
 
+// Clone returns a shallow clone of the Server.
 func (s *Server) Clone() *Server {
 	return &Server{
 		Name:     s.Name,
@@ -500,6 +578,7 @@ func (s *Server) Clone() *Server {
 	}
 }
 
+// AddNewProxy creates a url.URL and passes it to AddNewProxyWithURL.
 func (s *Server) AddNewProxy(addr string) error {
 	u, err := url.Parse(addr)
 	if err != nil {
@@ -509,14 +588,19 @@ func (s *Server) AddNewProxy(addr string) error {
 	return nil
 }
 
+// AddNewProxyWithURL creates a new httputil.ReverseProxy and calls AddProxy
+// with it.
 func (s *Server) AddNewProxyWithURL(u *url.URL) {
 	s.AddProxy(httputil.NewSingleHostReverseProxy(u))
 }
 
+// Proxy returns the httputil.ReverseProxy attached to the server.
 func (s *Server) Proxy() *httputil.ReverseProxy {
 	return s.proxy
 }
 
+// AddProxy attaches the reverse proxy to the Server. A proxy is required to
+// add a Server to a router.
 func (s *Server) AddProxy(p *httputil.ReverseProxy) {
 	p.ErrorLog = Logger
 	// The ReverseProxy will log an error if it's original director isn't called
@@ -623,3 +707,25 @@ func mustValue[T any](v T, err error) T {
 	}
 	return v
 }
+
+const indexHtml = `
+<!DOCTYPE html>
+
+<html lang="en-US">
+
+<head>
+  <title>Gory Proxy</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+
+<body>
+  {{range .}}
+    <a href="/{{.Path}}">{{.Name}}</a></br>
+  {{end}}
+</body>
+
+</html>
+`
+
+var tmpl = template.Must(template.New("index.html").Parse(indexHtml))

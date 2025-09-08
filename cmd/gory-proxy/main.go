@@ -9,10 +9,8 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
-	"runtime"
 
-	"github.com/johnietre/gory-proxy/server"
+	server "github.com/johnietre/gory-proxy"
 	jtutils "github.com/johnietre/utils/go"
 	"github.com/spf13/cobra"
 )
@@ -44,16 +42,17 @@ func makeServerCmd() *cobra.Command {
 	flags.String("tunnel", "", "Address to connect tunnel to")
 	flags.String("name",
 		"",
-		"Name of the server displayed on the tunneled-to proxy (must have tunnel flag",
+		"Name of the server displayed on the tunneled-to proxy (must have tunnel flag)",
 	)
 	flags.String(
 		"path",
 		"",
-		"Path of the server on the tunneled-to proxy (must have tunnel flag",
+		"Path of the server on the tunneled-to proxy (must have tunnel flag)",
 	)
 	flags.Bool("hidden", false, "Whether the tunnel server should be hidden")
 	flags.String("cert", "", "Path to cert file for TLS")
 	flags.String("key", "", "Path to key file for TLS")
+	flags.StringVar(&server.LogFilePath, "log", "", "Path to log file (empty means stderr)")
 	cmd.MarkFlagsRequiredTogether("cert", "key")
 	cmd.MarkFlagsRequiredTogether("name", "path")
 
@@ -61,16 +60,13 @@ func makeServerCmd() *cobra.Command {
 }
 
 func runServer(cmd *cobra.Command, _ []string) {
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		server.Logger.Fatal("error getting log directory")
+	if server.LogFilePath != "" {
+		f, err := os.OpenFile(server.LogFilePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			server.Logger.Fatal(err)
+		}
+		server.Logger.SetOutput(f)
 	}
-	server.LogFilePath = filepath.Join(filepath.Dir(thisFile), "proxy.log")
-	f, err := os.OpenFile(server.LogFilePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
-	if err != nil {
-		server.Logger.Fatal(err)
-	}
-	server.Logger.SetOutput(f)
 
 	flags := cmd.Flags()
 	addr := jtutils.Must(flags.GetString("addr"))
@@ -91,6 +87,7 @@ func runServer(cmd *cobra.Command, _ []string) {
 	}
 
 	var r *server.Router
+	var err error
 	if tunnelAddr != "" {
 		if tunnelSrvr.Name == "" || tunnelSrvr.Path == "" {
 			fmt.Fprintln(os.Stderr, "must provide name and path when tunneling")
