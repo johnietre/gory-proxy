@@ -49,6 +49,9 @@ type Router struct {
 	tunnelAddr   string
 	tunnelConn   net.Conn
 	tunnelServer *Server
+
+	savePath string
+	saveMtx  jtutils.Mutex[jtutils.Unit]
 }
 
 // NewRouterHandler creates a new Router to be used solely as an http.Handler.
@@ -131,6 +134,19 @@ func (r *Router) IsHandlerOnly() bool {
 	return r.ln == nil && r.acceptChan == nil
 }
 
+// SaveOnChangeTo sets what path the router should save its servers to. An
+// empty path means nothing is saved. Should not be called after the router
+// has been started (whether it's serving as a handler or started as a server).
+func (r *Router) SaveOnChangeTo(path string) {
+	r.savePath = path
+}
+
+// SavePath returns the path the router saves its servers to. An empty path
+// means nothing is saved.
+func (r *Router) SavePath() string {
+	return r.savePath
+}
+
 // ServeHTTP implements the http.Handler interface.
 func (router *Router) ServeHTTP(w RW, r Req) {
 	// Get the base path slug
@@ -145,7 +161,8 @@ func (router *Router) ServeHTTP(w RW, r Req) {
 		baseSlug = r.URL.Path[1:]
 	}
 	if !router.IsHandlerOnly() {
-		if baseSlug == "" {
+		switch baseSlug {
+		case "":
 			switch r.Method {
 			case http.MethodPost:
 				router.addServer(w, r)
@@ -155,7 +172,7 @@ func (router *Router) ServeHTTP(w RW, r Req) {
 				router.serveHome(w, r)
 			}
 			return
-		} else if baseSlug == "log" {
+		case "log":
 			router.serveLog(w, r)
 			return
 		}
@@ -183,6 +200,10 @@ var (
 
 // AddServer adds a server (i.e., a new path) to the proxy.
 func (router *Router) AddServer(srvr *Server) error {
+	return router.addServerHelper(srvr, true)
+}
+
+func (router *Router) addServerHelper(srvr *Server, checkSave bool) error {
 	if srvr.Path == "" || srvr.Name == "" {
 		return fmt.Errorf("must have server name and path")
 	} else if srvr.proxy == nil {
@@ -190,7 +211,39 @@ func (router *Router) AddServer(srvr *Server) error {
 	} else if _, loaded := router.routes.LoadOrStore(srvr.Path, srvr.Clone()); loaded {
 		return ErrServerExists
 	}
+	if checkSave {
+		return router.saveServers()
+	}
 	return nil
+}
+
+// AddServers adds the servers from the map by passing each to
+// `Router.AddServer`. The returned map is a mapping of servers and
+// corresponding errors from adding them. If a server is successfully added, it
+// will not be present as a key in the returned map. The map will never be nil.
+// An error is returned if an error occurs while saving (if applicable).
+func (router *Router) AddServers(srvrs map[string]*Server) (map[*Server]error, error) {
+	errs := map[*Server]error{}
+	for _, srvr := range srvrs {
+		err := router.addServerHelper(srvr, false)
+		if err != nil {
+			errs[srvr] = err
+		}
+	}
+	return errs, router.saveServers()
+}
+
+func (router *Router) saveServers() error {
+	if router.savePath == "" {
+		return nil
+	}
+	bytes, err := json.Marshal(router.GetServers())
+	if err != nil {
+		return err
+	}
+	router.saveMtx.Lock()
+	defer router.saveMtx.Unlock()
+	return os.WriteFile(router.savePath, bytes, 0777)
 }
 
 var (
@@ -213,7 +266,7 @@ func (router *Router) DeleteServer(srvr *Server) error {
 		return ErrMismatchAddr
 	}
 	router.routes.Delete(srvr.Path)
-	return nil
+	return router.saveServers()
 }
 
 // GetServers returns clones of the stored servers.
@@ -549,7 +602,7 @@ func connectTunnel(addr string, s *Server) (net.Conn, error) {
 }
 
 // Server is a proxied-to server. To add a server to the router, a proxy
-// must be attached with AddNewProxy, AddNewProxyWithURL, or AddProxy.
+// must be attached with one of the AddNewProxy*/AddProxy methods.
 type Server struct {
 	// Name is the display name for the server.
 	Name string `json:"name,omitempty"`
@@ -578,7 +631,8 @@ func (s *Server) Clone() *Server {
 	}
 }
 
-// AddNewProxy creates a url.URL and passes it to AddNewProxyWithURL.
+// AddNewProxy creates a url.URL and passes it to AddNewProxyWithURL. Returns
+// an error if the a URL can't be parsed.
 func (s *Server) AddNewProxy(addr string) error {
 	u, err := url.Parse(addr)
 	if err != nil {
@@ -592,6 +646,12 @@ func (s *Server) AddNewProxy(addr string) error {
 // with it.
 func (s *Server) AddNewProxyWithURL(u *url.URL) {
 	s.AddProxy(httputil.NewSingleHostReverseProxy(u))
+}
+
+// AddNewProxyFromAddr calls `Server.AddNewProxy` with the server's
+// `Server.Addr` field.
+func (s *Server) AddNewProxyFromAddr() error {
+	return s.AddNewProxy(s.Addr)
 }
 
 // Proxy returns the httputil.ReverseProxy attached to the server.
