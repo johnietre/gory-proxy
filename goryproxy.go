@@ -20,6 +20,7 @@ import (
 	"time"
 
 	jtutils "github.com/johnietre/utils/go"
+	"go.uber.org/zap"
 )
 
 type RW = http.ResponseWriter
@@ -30,16 +31,23 @@ const tunnelQueueLen uint32 = 1000
 var (
 	// Logger is the logger used.
 	Logger = log.New(os.Stderr, "", log.LstdFlags|log.Lshortfile)
+	// Currently unused
+	ZapLogger *zap.Logger
 	// LogFilePath is used to serve a log file if a file is logged to.
 	LogFilePath string
+
+	TunnelConnectTimeout time.Duration
 )
 
-// Router is a proxy router used to proxy connections. It can be used as a
-// server as well as an http.Handler.
+// Router is a proxy router used to proxy connections. To use it solely as a
+// handler, create it from NewRouterHandler. To use as a with its full
+// functionality, create from any of the functions and use as both a handler
+// and listener (e.g., http.Serve(router, router)).
 type Router struct {
 	ln         net.Listener
 	acceptChan chan net.Conn
 	lnErr      error
+	started    atomic.Bool
 
 	routes jtutils.SyncMap[string, *Server]
 
@@ -54,6 +62,28 @@ type Router struct {
 	saveMtx  jtutils.Mutex[jtutils.Unit]
 }
 
+// RunHTTP creates a http.Server and runs it using the Router as the handler
+// and listener (http.Server.Serve(r)).
+func (r *Router) RunHTTP() error {
+	r.Start()
+	s := &http.Server{
+		Handler:  r,
+		ErrorLog: Logger,
+	}
+	return s.Serve(r)
+}
+
+// RunHTTPS creates a http.Server and runs it using the Router as the handler
+// and listener (http.Server.ServeTLS(r, keyFile, certFile)).
+func (r *Router) RunHTTPS(keyFile, certFile string) error {
+	r.Start()
+	s := &http.Server{
+		Handler:  r,
+		ErrorLog: Logger,
+	}
+	return s.ServeTLS(r, keyFile, certFile)
+}
+
 // NewRouterHandler creates a new Router to be used solely as an http.Handler.
 func NewRouterHandler() *Router {
 	return &Router{}
@@ -62,48 +92,26 @@ func NewRouterHandler() *Router {
 // NewRouter creates a new Router which listens on the given addr. It can also
 // be used as an http.Handler.
 func NewRouter(addr string) (*Router, error) {
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return nil, err
-	}
-	r := &Router{ln: ln, acceptChan: make(chan net.Conn, 5)}
-	for i := uint32(0); i < tunnelQueueLen; i++ {
-		r.tunnelQueue[i] = make(chan net.Conn)
-	}
-	go r.listen()
-	return r, nil
+	return RouterConfig{LnFunc: ConnectLn(addr), Start: true}.Create()
 }
 
 // RouterFromListener creates a new Router with the given `ln`. It can also be
 // used as an http.Handler.
 func RouterFromListener(ln net.Listener) *Router {
-	r := &Router{ln: ln, acceptChan: make(chan net.Conn, 5)}
-	for i := uint32(0); i < tunnelQueueLen; i++ {
-		r.tunnelQueue[i] = make(chan net.Conn)
-	}
-	go r.listen()
-	return r
+	return jtutils.Must(RouterConfig{LnFunc: ReturnLn(ln), Start: true}.Create())
 }
 
 // NewTunneledRouter creates a new Router which listens on the given addr
 // and tunnels to the given tunnelAddr. The passed Server `s` is the server
 // used for the tunneled-to proxy. It can also be used as an http.Handler.
 func NewTunneledRouter(addr, tunnelAddr string, s *Server) (*Router, error) {
-	// Connect to the tunnel
 	s.Addr = "tunnel"
-	c, err := connectTunnel(tunnelAddr, s)
-	if err != nil {
-		return nil, err
-	}
-	// Create the router
-	r, err := NewRouter(addr)
-	if err == nil {
-		r.tunnelAddr = tunnelAddr
-		r.tunnelConn = c
-		r.tunnelServer = s
-		go r.listenTunnel()
-	}
-	return r, err
+	return RouterConfig{
+		LnFunc:       ConnectLn(addr),
+		TunnelAddr:   tunnelAddr,
+		TunnelServer: s,
+		Start:        true,
+	}.Create()
 }
 
 // TunneledRouterFromListener creates a new Router with the given `ln` and
@@ -114,19 +122,133 @@ func TunneledRouterFromListener(
 	tunnelAddr string,
 	s *Server,
 ) (*Router, error) {
-	// Connect to the tunnel
 	s.Addr = "tunnel"
-	c, err := connectTunnel(tunnelAddr, s)
+	return RouterConfig{
+		LnFunc:       ReturnLn(ln),
+		TunnelAddr:   tunnelAddr,
+		TunnelServer: s,
+		Start:        true,
+	}.Create()
+}
+
+// RouterConfig are the options passed to RouterFromConfig
+type RouterConfig struct {
+	// LnFunc is the function to get the listener from (see ReturnLn and
+	// ConnectLn).
+	// It must be specified.
+	LnFunc func() (net.Listener, error)
+
+	// TunnelAddr is the address to tunnel to. When tunneling, both this and
+	// TunnelServer must be provided.
+	TunnelAddr string
+	// TunnelServer is the server used for the tunneled-to proxy. When tunneling,
+	// both this and TunnelAddr must be provided.
+	TunnelServer *Server
+
+	// SaveTo is the path to save changes in servers to. An empty string means
+	// nothing is saved.
+	SaveTo string
+	// LoadFrom is the path to load servers from (to populate router). An empty
+	// string means nothing is loaded. Loading occurs before anything else (e.g.,
+	// before LnFunc is called).
+	LoadFrom string
+
+	// AcceptChanLen is the length of the channel that holds newly accepted conns
+	// from the listener. When the channel is full, no more conns are accepted
+	// until a conn is removed from the channel. A value <= 0 defaults to 5.
+	AcceptChanLen int
+
+	// Start specifies whether or not to start the router after creation.
+	Start bool
+}
+
+// ReturnLn creates a function that returns the listener (and never errors).
+func ReturnLn(ln net.Listener) func() (net.Listener, error) {
+	return func() (net.Listener, error) { return ln, nil }
+}
+
+// ConnectLn returns a function that calls and returns the result of
+// net.Listen("tcp", addr).
+func ConnectLn(addr string) func() (net.Listener, error) {
+	return func() (net.Listener, error) { return net.Listen("tcp", addr) }
+}
+
+// Create creates the router (see RouterFromConfig).
+func (ro RouterConfig) Create() (*Router, error) {
+	return RouterFromConfig(ro)
+}
+
+// RouterFromConfig creates a new Router from the give options. It does NOT
+// automatically start the router (unless specified in the opts).
+func RouterFromConfig(opts RouterConfig) (*Router, error) {
+	var err error
+
+	if opts.LnFunc == nil {
+		return nil, fmt.Errorf("must provide LnFunc")
+	}
+
+	if opts.AcceptChanLen <= 0 {
+		opts.AcceptChanLen = 5
+	}
+	r := &Router{
+		acceptChan:   make(chan net.Conn, opts.AcceptChanLen),
+		tunnelAddr:   opts.TunnelAddr,
+		tunnelServer: opts.TunnelServer,
+		savePath:     opts.SaveTo,
+	}
+	for i := range tunnelQueueLen {
+		r.tunnelQueue[i] = make(chan net.Conn)
+	}
+
+	if opts.LoadFrom != "" {
+		err := r.LoadServers(opts.LoadFrom)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if opts.TunnelAddr != "" || opts.TunnelServer != nil {
+		if opts.TunnelAddr == "" || opts.TunnelServer == nil {
+			return nil, fmt.Errorf("tunneled router must have both tunnel addr and tunnel server")
+		}
+		r.tunnelConn, err = connectTunnel(r.tunnelAddr, r.tunnelServer)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	ln, err := opts.LnFunc()
 	if err != nil {
 		return nil, err
 	}
-	// Create the router
-	r := RouterFromListener(ln)
-	r.tunnelAddr = tunnelAddr
-	r.tunnelConn = c
-	r.tunnelServer = s
-	go r.listenTunnel()
+	r.ln = ln
+
+	if opts.Start {
+		r.Start()
+	}
 	return r, nil
+}
+
+// Start starts the router (if its not a handler only and isn't already
+// running).
+func (r *Router) Start() {
+	if r.ln == nil || r.started.Swap(true) {
+		return
+	}
+	go r.listen()
+	if r.tunnelAddr != "" {
+		go r.listenTunnel()
+	}
+}
+
+// LoadServers attempts to load servers from the specified path. If the
+// specified path is empty (blank string), the path servers are saved to (if
+// set) is used.
+func (r *Router) LoadServers(path string) error {
+	if path == "" {
+		return r.loadServers(nil)
+	}
+	return r.loadServers(&path)
 }
 
 // IsHandlerOnly returns whether the proxy can only be used as a handler.
@@ -178,7 +300,6 @@ func (router *Router) ServeHTTP(w RW, r Req) {
 		}
 	}
 	if server, ok := router.routes.Load(baseSlug); ok {
-		// TODO: Set "Forwarded" header
 		if r.URL.Path[0] == '/' {
 			baseSlug = "/" + baseSlug
 		}
@@ -246,6 +367,31 @@ func (router *Router) saveServers() error {
 	return os.WriteFile(router.savePath, bytes, 0777)
 }
 
+func (router *Router) loadServers(pathPtr *string) error {
+	path := router.savePath
+	if pathPtr != nil {
+		path = *pathPtr
+	}
+	if path == "" {
+		return nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	m := make(map[string]*Server)
+	if err := json.NewDecoder(f).Decode(&m); err != nil {
+		return err
+	}
+	for _, srvr := range m {
+		if err := router.addServerHelper(srvr, false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 var (
 	// ErrServerNotExist is returned when trying to remove a server that doesn't
 	// exist.
@@ -271,6 +417,7 @@ func (router *Router) DeleteServer(srvr *Server) error {
 
 // GetServers returns clones of the stored servers.
 func (router *Router) GetServers() map[string]*Server {
+	// TODO: ignore tunnels? only when saving?
 	srvrs := make(map[string]*Server)
 	router.routes.Range(func(path string, srvr *Server) bool {
 		srvrs[path] = srvr.Clone()
@@ -505,9 +652,8 @@ func (router *Router) listenTunnel() {
 tunnelLoop:
 	for {
 		var buf [8]byte
-		// TODO: Log error?
 		if n, err := router.tunnelConn.Read(buf[:]); err != nil {
-			log.Println("tunnel disconnected")
+			Logger.Println("tunnel disconnected")
 			for {
 				// TODO: Do more with error
 				c, err := connectTunnel(router.tunnelAddr, router.tunnelServer)
@@ -571,33 +717,40 @@ func connectTunnel(addr string, s *Server) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	shouldRun := jtutils.NewT(true)
+	deferrer := jtutils.NewDeferredCloser(shouldRun)
+	defer deferrer.Run()
+	deferrer.Add(c)
+
+	if TunnelConnectTimeout > 0 {
+		if err := c.SetDeadline(time.Now().Add(TunnelConnectTimeout)); err != nil {
+			return nil, err
+		}
+		defer c.SetDeadline(time.Time{})
+	}
 	// Marshal and the send the server data, then wait for a response
 	buf, err := json.Marshal(s)
 	if err != nil {
-		c.Close()
 		return nil, err
 	}
 	if _, err := c.Write(append(headerTunnelBytes, buf...)); err != nil {
-		c.Close()
 		return nil, fmt.Errorf("error writing when connecting: %w", err)
-	} else if _, err := c.Read(buf); err != nil { // TODO: Use deadline?
-		c.Close()
+	} else if _, err := c.Read(buf); err != nil {
 		return nil, fmt.Errorf("error reading when connecting: %w", err)
 	}
 	// Check the response
 	switch getHeader(buf) {
 	case HeaderSuccess:
 	case HeaderBadMessage:
-		c.Close()
 		return nil, newTunnelError(HeaderBadMessage, "bad name or path")
 	case HeaderAlreadyExists:
-		c.Close()
 		return nil, newTunnelError(
 			HeaderAlreadyExists, "name or path already exists on tunneled-to server")
 	default:
-		c.Close()
 		return nil, newTunnelError(HeaderNothing, "an error occurred")
 	}
+	*shouldRun = false
 	return c, nil
 }
 
@@ -664,15 +817,27 @@ func (s *Server) Proxy() *httputil.ReverseProxy {
 func (s *Server) AddProxy(p *httputil.ReverseProxy) {
 	p.ErrorLog = Logger
 	// The ReverseProxy will log an error if it's original director isn't called
-	if d := p.Director; d == nil {
-		p.Director = func(r *http.Request) {
-			r.Header.Add("Gory-Proxy-Path", s.Path)
+	/*
+		if d := p.Director; d == nil {
+			p.Director = func(r *http.Request) {
+				r.Header.Add("Gory-Proxy-Path", s.Path)
+			}
+		} else {
+			p.Director = func(r *http.Request) {
+				r.Header.Add("Gory-Proxy-Path", s.Path)
+				d(r)
+			}
 		}
-	} else {
-		p.Director = func(r *http.Request) {
-			r.Header.Add("Gory-Proxy-Path", s.Path)
-			d(r)
-		}
+	*/
+	rwf := p.Rewrite
+	if rwf == nil {
+		rwf = noopRewrite
+	}
+	p.Rewrite = func(r *httputil.ProxyRequest) {
+		// TODO: Forwarded
+		r.Out.Header.Add("Gory-Proxy-Path", s.Path)
+		r.Out.Header["X-Forwarded-For"] = r.In.Header["X-Forwarded-For"]
+		r.SetXForwarded()
 	}
 	/*
 	  p.ModifyResponse = func(resp *http.Response) error {
@@ -682,6 +847,8 @@ func (s *Server) AddProxy(p *httputil.ReverseProxy) {
 	*/
 	s.proxy = p
 }
+
+func noopRewrite(*httputil.ProxyRequest) {}
 
 type pageData struct {
 	Name, Path string
